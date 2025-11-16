@@ -610,6 +610,7 @@ class RecruiterInfoTracker:
 def initialize_logging(logs_dir):
     """
     Creates the logs directory and opens a timestamped log file for this session.
+    Creates/updates a 'latest.log' symlink pointing to the current log file.
     Returns the file handle, filename, and log filepath.
     """
     # Create logs directory if it doesn't exist
@@ -639,6 +640,18 @@ def initialize_logging(logs_dir):
     log_file.write("Salary: Not yet mentioned\n")
     log_file.write("\n" + "=" * 80 + "\n\n")
     log_file.flush()
+    
+    # Create/update symlink to latest log
+    latest_log_link = os.path.join(logs_dir, 'latest.log')
+    try:
+        # Remove existing symlink if it exists
+        if os.path.exists(latest_log_link) or os.path.islink(latest_log_link):
+            os.remove(latest_log_link)
+        # Create new symlink pointing to current log file
+        os.symlink(log_filename, latest_log_link)
+    except Exception as e:
+        # Silently fail if symlink creation fails (e.g., on Windows without admin rights)
+        pass
     
     return log_file, log_filename, log_filepath
 
