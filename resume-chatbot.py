@@ -15,6 +15,12 @@ CONFIG_FILE = "config.ini"
 LLM_MODEL = "llama3"
 EMBEDDING_MODEL = "nomic-embed-text"
 
+# Context window management settings
+# These can be overridden in config.ini
+DEFAULT_MAX_HISTORY_TOKENS = 2000  # Maximum tokens for conversation history
+DEFAULT_MIN_RECENT_MESSAGES = 6    # Always keep at least this many recent messages (3 exchanges)
+DEFAULT_SUMMARY_THRESHOLD = 0.8    # Summarize when history exceeds this fraction of max tokens
+
 # We will store our processed data here
 DATA_DIR = "data"
 CHUNKS_FILE = os.path.join(DATA_DIR, "chunks.json")
@@ -96,7 +102,7 @@ def process_and_embed_resume():
     # 3. Check if we have any text at all
     if not full_text.strip():
         print("Error: No text found from resume or personal info file.")
-        print(f"Please make sure '{RESUME_PDF_PATH}' or '{PERSONAL_INFO_PATH}' exists.")
+        print(f"Please make sure '{RESUME_PDF_PATH}' or '{PERSONAL_INFO_MD_PATH}' or '{PERSONAL_INFO_TXT_PATH}' exists.")
         return None, None
         
     print(f"Processing combined text...")
@@ -175,6 +181,121 @@ def cosine_similarity(v1, v2):
     
     return dot_product / (norm_v1 * norm_v2)
 
+def estimate_tokens(text):
+    """
+    Estimates token count from text. Uses a simple approximation:
+    ~4 characters per token for English text (conservative estimate).
+    """
+    if not text:
+        return 0
+    # Rough approximation: 1 token ≈ 4 characters for English
+    # This is conservative to ensure we stay within limits
+    return len(text) // 4
+
+class ContextManager:
+    """
+    Manages conversation history with context window limits.
+    Ensures resume context is always preserved while managing history size.
+    """
+    
+    def __init__(self, max_history_tokens=DEFAULT_MAX_HISTORY_TOKENS,
+                 min_recent_messages=DEFAULT_MIN_RECENT_MESSAGES,
+                 summary_threshold=DEFAULT_SUMMARY_THRESHOLD,
+                 llm_model=LLM_MODEL):
+        self.max_history_tokens = max_history_tokens
+        self.min_recent_messages = min_recent_messages
+        self.summary_threshold = summary_threshold
+        self.llm_model = llm_model
+        self.history = []  # List of (role, message) tuples
+        self.summary = None  # Summarized older conversation
+        
+    def add_exchange(self, user_message, bot_message):
+        """
+        Add a user-bot exchange to the history.
+        """
+        self.history.append(("User", user_message))
+        self.history.append(("Bot", bot_message))
+        self._manage_context()
+    
+    def _manage_context(self):
+        """
+        Manages context window by summarizing old messages when needed.
+        Always preserves recent messages to maintain conversation flow.
+        """
+        # Calculate current history size
+        history_text = self._format_history(self.history)
+        history_tokens = estimate_tokens(history_text)
+        
+        # Check if we need to manage context
+        if history_tokens <= self.max_history_tokens * self.summary_threshold:
+            return  # No action needed
+        
+        # We need to summarize. Keep recent messages, summarize older ones
+        recent_count = max(self.min_recent_messages, len(self.history) // 4)
+        recent_messages = self.history[-recent_count:]
+        old_messages = self.history[:-recent_count]
+        
+        if not old_messages:
+            # Can't reduce further without losing recent context
+            return
+        
+        # Create or update summary of old messages
+        old_history_text = self._format_history(old_messages)
+        if self.summary:
+            # Combine existing summary with new old messages
+            summary_prompt = (
+                f"Previous conversation summary:\n{self.summary}\n\n"
+                f"Additional conversation to add to summary:\n{old_history_text}\n\n"
+                f"Create a concise summary that captures the key points from both the previous summary "
+                f"and the additional conversation. Focus on facts, decisions, and important context. "
+                f"Keep it brief (under 200 words)."
+            )
+        else:
+            summary_prompt = (
+                f"Summarize the following conversation, focusing on key facts, decisions, "
+                f"and important context. Keep it brief (under 200 words):\n\n{old_history_text}"
+            )
+        
+        try:
+            response = ollama.generate(
+                model=self.llm_model,
+                prompt=summary_prompt,
+                stream=False
+            )
+            self.summary = response['response'].strip()
+            
+            # Replace old messages with summary
+            self.history = recent_messages
+            
+        except Exception as e:
+            print(f"\nWarning: Could not summarize conversation history: {e}")
+            # Fallback: just truncate to recent messages
+            self.history = recent_messages
+    
+    def _format_history(self, messages):
+        """
+        Formats a list of (role, message) tuples into a history string.
+        """
+        return "\n".join([f"{role}: {message}" for role, message in messages])
+    
+    def get_formatted_history(self):
+        """
+        Returns the formatted conversation history, including summary if present.
+        """
+        parts = []
+        if self.summary:
+            parts.append(f"[Earlier conversation summary: {self.summary}]")
+        if self.history:
+            parts.append(self._format_history(self.history))
+        return "\n".join(parts) if parts else ""
+    
+    def get_history_token_count(self):
+        """
+        Returns estimated token count of current history.
+        """
+        history_text = self.get_formatted_history()
+        return estimate_tokens(history_text)
+
 def find_relevant_chunks(query_embedding, all_embeddings, text_chunks, k=3):
     """
     Finds the top-k most similar chunks to the query.
@@ -211,6 +332,11 @@ def main():
         print(f"'{CONFIG_FILE}' not found. Creating a default config file.")
         try:
             config['Chatbot'] = {'SystemPrompt': DEFAULT_SYSTEM_PROMPT}
+            config['Context'] = {
+                'MaxHistoryTokens': str(DEFAULT_MAX_HISTORY_TOKENS),
+                'MinRecentMessages': str(DEFAULT_MIN_RECENT_MESSAGES),
+                'SummaryThreshold': str(DEFAULT_SUMMARY_THRESHOLD)
+            }
             with open(CONFIG_FILE, 'w') as configfile:
                 config.write(configfile)
             print(f"Default '{CONFIG_FILE}' created successfully.")
@@ -225,6 +351,11 @@ def main():
 
     # Load the prompt, falling back to the default if it's missing
     system_prompt = config.get('Chatbot', 'SystemPrompt', fallback=DEFAULT_SYSTEM_PROMPT)
+    
+    # Load context management settings
+    max_history_tokens = config.getint('Context', 'MaxHistoryTokens', fallback=DEFAULT_MAX_HISTORY_TOKENS)
+    min_recent_messages = config.getint('Context', 'MinRecentMessages', fallback=DEFAULT_MIN_RECENT_MESSAGES)
+    summary_threshold = config.getfloat('Context', 'SummaryThreshold', fallback=DEFAULT_SUMMARY_THRESHOLD)
     
     start_time = time.time()
     
@@ -244,9 +375,15 @@ def main():
     end_time = time.time()
     print(f"\n--- Ready to chat! (Setup took {end_time - start_time:.2f}s) ---")
     print("Ask any question about the resume. Type 'quit' to exit.")
+    print(f"Context management: Max history tokens={max_history_tokens}, Min recent messages={min_recent_messages}")
 
-    # --- New: Create a list to store the chat history ---
-    chat_history = []
+    # --- Create context manager to handle conversation history ---
+    context_manager = ContextManager(
+        max_history_tokens=max_history_tokens,
+        min_recent_messages=min_recent_messages,
+        summary_threshold=summary_threshold,
+        llm_model=LLM_MODEL
+    )
 
     # 2. Start the chat loop
     try:
@@ -280,22 +417,33 @@ def main():
             )
             
             # 5. Create the prompt
-            context = "\n\n".join(relevant_chunks)
+            # Resume context is always included - this is the source of truth
+            resume_context = "\n\n".join(relevant_chunks)
             
-            # --- New: Build the history string ---
-            history_string = "\n".join(chat_history)
+            # Get managed conversation history
+            history_string = context_manager.get_formatted_history()
             
             # --- System prompt is now loaded from config at the start of main() ---
             
+            # Build prompt with clear separation between history and resume context
+            # Resume context is always preserved to prevent hallucination
             full_prompt = (
                 f"{system_prompt}\n\n"
-                f"Conversation History:\n"
+            )
+            
+            # Only include history section if there's actual history
+            if history_string.strip():
+                full_prompt += (
+                    f"Conversation History:\n"
+                    f"-----------------\n"
+                    f"{history_string}\n"
+                    f"-----------------\n\n"
+                )
+            
+            full_prompt += (
+                f"Resume Context (source of truth - always refer to this for factual information):\n"
                 f"-----------------\n"
-                f"{history_string}\n"
-                f"-----------------\n\n"
-                f"Resume Context:\n"
-                f"-----------------\n"
-                f"{context}\n"
+                f"{resume_context}\n"
                 f"-----------------\n\n"
                 f"Question: {question}\n\n"
                 f"Answer:"
@@ -319,9 +467,13 @@ def main():
                         full_response += response_part
                 print() # Newline after the full response
                 
-                # --- New: Add this turn to the history ---
-                chat_history.append(f"User: {question}")
-                chat_history.append(f"Bot: {full_response.strip()}")
+                # Add this exchange to context manager (handles windowing automatically)
+                context_manager.add_exchange(question, full_response.strip())
+                
+                # Optional: Show context stats (can be removed or made configurable)
+                history_tokens = context_manager.get_history_token_count()
+                if history_tokens > max_history_tokens * 0.7:
+                    print(f"\n[Context: {history_tokens}/{max_history_tokens} tokens used]")
 
             except Exception as e:
                 print(f"\nAn error occurred while generating the response: {e}")
