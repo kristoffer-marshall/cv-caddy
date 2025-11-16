@@ -6,6 +6,8 @@ import json
 import time
 import argparse
 import configparser
+import sys
+from datetime import datetime
 
 # --- CONFIGURATION ---
 RESUME_PDF_PATH = "YOUR_RESUME.pdf"
@@ -25,6 +27,9 @@ DEFAULT_SUMMARY_THRESHOLD = 0.8    # Summarize when history exceeds this fractio
 DATA_DIR = "data"
 CHUNKS_FILE = os.path.join(DATA_DIR, "chunks.json")
 EMBEDDINGS_FILE = os.path.join(DATA_DIR, "embeddings.npy")
+
+# Logs directory for conversation logs
+LOGS_DIR = "logs"
 
 # --- Default prompt (if config.ini is missing) ---
 DEFAULT_SYSTEM_PROMPT = (
@@ -311,6 +316,42 @@ def find_relevant_chunks(query_embedding, all_embeddings, text_chunks, k=3):
     # Return the text of those chunks
     return [text_chunks[i] for i in top_k_indices]
 
+def initialize_logging():
+    """
+    Creates the logs directory and opens a timestamped log file for this session.
+    Returns the file handle and filename.
+    """
+    # Create logs directory if it doesn't exist
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    
+    # Create timestamped filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"conversation_{timestamp}.log"
+    log_filepath = os.path.join(LOGS_DIR, log_filename)
+    
+    # Open log file in append mode (though it will be new)
+    log_file = open(log_filepath, 'a', encoding='utf-8')
+    
+    # Write session header
+    session_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_file.write(f"{'='*80}\n")
+    log_file.write(f"Conversation Session Started: {session_start}\n")
+    log_file.write(f"{'='*80}\n\n")
+    log_file.flush()
+    
+    return log_file, log_filename
+
+def log_exchange(log_file, user_question, bot_response):
+    """
+    Logs a user-bot exchange to the log file.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    log_file.write(f"[{timestamp}] User:\n{user_question}\n\n")
+    log_file.write(f"[{timestamp}] Bot:\n{bot_response}\n\n")
+    log_file.write(f"{'-'*80}\n\n")
+    log_file.flush()
+
 def main():
     """
     Main function to run the chatbot.
@@ -377,6 +418,10 @@ def main():
     print("Ask any question about the resume. Type 'quit' to exit.")
     print(f"Context management: Max history tokens={max_history_tokens}, Min recent messages={min_recent_messages}")
 
+    # --- Initialize logging ---
+    log_file, log_filename = initialize_logging()
+    print(f"Conversation log: {log_filename}")
+    
     # --- Create context manager to handle conversation history ---
     context_manager = ContextManager(
         max_history_tokens=max_history_tokens,
@@ -470,6 +515,9 @@ def main():
                 # Add this exchange to context manager (handles windowing automatically)
                 context_manager.add_exchange(question, full_response.strip())
                 
+                # Log this exchange
+                log_exchange(log_file, question, full_response.strip())
+                
                 # Optional: Show context stats (can be removed or made configurable)
                 history_tokens = context_manager.get_history_token_count()
                 if history_tokens > max_history_tokens * 0.7:
@@ -477,9 +525,31 @@ def main():
 
             except Exception as e:
                 print(f"\nAn error occurred while generating the response: {e}")
+                # Log the error
+                try:
+                    error_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    log_file.write(f"[{error_timestamp}] Error: {str(e)}\n\n")
+                    log_file.flush()
+                except:
+                    pass  # Ignore logging errors
 
     except KeyboardInterrupt:
         print("\nGoodbye!")
+    finally:
+        # Always close the log file, whether normal exit or interrupt
+        try:
+            session_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_file.write(f"{'='*80}\n")
+            # Check if we're exiting due to KeyboardInterrupt
+            exc_type = sys.exc_info()[0]
+            if exc_type is KeyboardInterrupt:
+                log_file.write(f"Conversation Session Ended (Interrupted): {session_end}\n")
+            else:
+                log_file.write(f"Conversation Session Ended: {session_end}\n")
+            log_file.write(f"{'='*80}\n")
+            log_file.close()
+        except:
+            pass  # Ignore errors when closing log file
 
 if __name__ == "__main__":
     main()

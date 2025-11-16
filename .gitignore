@@ -1,5 +1,6 @@
 personal_info*
 data/*
+logs/*
 *.pdf
 config.ini
 
