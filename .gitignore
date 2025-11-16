@@ -1,0 +1,10 @@
+personal_info*
+data/*
+*.pdf
+config.ini
+
+# Python Virtual Environment
+my-new-env/
+# Common convention, also good to ignore
+venv/
+.venv/
