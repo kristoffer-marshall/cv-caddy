@@ -7,6 +7,7 @@ import time
 import argparse
 import configparser
 import sys
+import re
 from datetime import datetime
 
 # --- CONFIGURATION ---
@@ -28,10 +29,9 @@ DEFAULT_CHUNK_SIZE = 1500
 DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_TOP_K_CHUNKS = 3
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a professional vulnerability management engineer who is talking to a recruiter or hiring manager. "
-    "Do not make up information. If the answer is not in the context, "
-    "politely state that you are unsure, but can get back to them later. "
-    "Use the knowledge from your resume, but do no reference your resume in conversation. Act casual."
+    "You ARE the person in the resume context. Speak in FIRST PERSON ('I', 'my', 'me'). "
+    "You are talking to a recruiter. Provide your name directly when asked - do not be evasive. "
+    "Do not make up information. If unsure, say so politely. Act casual and natural."
 )
 # ---------------------
 
@@ -51,24 +51,71 @@ def split_text_into_chunks(text, chunk_size, overlap):
         start += chunk_size - overlap
     return chunks
 
+def extract_name_from_text(text):
+    """
+    Attempts to extract a name from text. Looks for common patterns:
+    - First line that looks like a name (2-4 capitalized words)
+    - Patterns like "Name:", "My name is", etc.
+    Returns the first likely name found, or None.
+    """
+    if not text:
+        return None
+    
+    lines = text.strip().split('\n')
+    
+    # Check first few lines for a name pattern (typically at top of resume)
+    for line in lines[:5]:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Remove common prefixes
+        line_clean = re.sub(r'^(Name|NAME|Full Name|Full Name:)\s*:?\s*', '', line, flags=re.IGNORECASE)
+        line_clean = line_clean.strip()
+        
+        # Look for pattern: 2-4 capitalized words (likely a name)
+        name_pattern = r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})$'
+        match = re.match(name_pattern, line_clean)
+        if match:
+            name = match.group(1)
+            # Filter out common non-name words
+            if not any(word.lower() in ['resume', 'cv', 'curriculum', 'vitae', 'email', 'phone', 'address'] 
+                      for word in name.split()):
+                return name
+    
+    # Check for "My name is" pattern
+    name_match = re.search(r'(?:My name is|I am|I\'m)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})', text, re.IGNORECASE)
+    if name_match:
+        return name_match.group(1)
+    
+    # Check for "Name:" pattern anywhere
+    name_match = re.search(r'Name\s*:\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})', text, re.IGNORECASE)
+    if name_match:
+        return name_match.group(1)
+    
+    return None
+
 def process_and_embed_resume(resume_pdf_path, personal_info_txt_path, personal_info_md_path, 
                               data_dir, embedding_model, chunk_size, chunk_overlap):
     """
     Reads, chunks, and embeds the resume and personal info file.
     Saves chunks and embeddings to disk.
+    Returns text_chunks, all_embeddings, and personal_info_chunk_indices.
     """
     chunks_file = os.path.join(data_dir, "chunks.json")
     embeddings_file = os.path.join(data_dir, "embeddings.npy")
+    metadata_file = os.path.join(data_dir, "chunk_metadata.json")
     
     print("Checking for context files...")
-    full_text = ""
+    resume_text = ""
+    personal_info_text = ""
     
     # 1. Read PDF
     if os.path.exists(resume_pdf_path):
         try:
             doc = fitz.open(resume_pdf_path)
             for page in doc:
-                full_text += page.get_text() + "\n" # Add newline separator
+                resume_text += page.get_text() + "\n" # Add newline separator
             
             print(f"Successfully read {len(doc)} pages from PDF '{resume_pdf_path}'.")
             doc.close()
@@ -78,13 +125,13 @@ def process_and_embed_resume(resume_pdf_path, personal_info_txt_path, personal_i
     else:
         print(f"Warning: Resume file not found at '{resume_pdf_path}'.")
 
-    # 2. Read personal info (MD or TXT)
+    # 2. Read personal info (MD or TXT) separately
     personal_file_found = False
     # Prioritize Markdown file
     if os.path.exists(personal_info_md_path):
         try:
             with open(personal_info_md_path, "r") as f:
-                full_text += f.read()
+                personal_info_text = f.read()
             print(f"Successfully read markdown file '{personal_info_md_path}'.")
             personal_file_found = True
         except Exception as e:
@@ -94,7 +141,7 @@ def process_and_embed_resume(resume_pdf_path, personal_info_txt_path, personal_i
     if not personal_file_found and os.path.exists(personal_info_txt_path):
         try:
             with open(personal_info_txt_path, "r") as f:
-                full_text += f.read()
+                personal_info_text = f.read()
             print(f"Successfully read text file '{personal_info_txt_path}'.")
             personal_file_found = True
         except Exception as e:
@@ -104,16 +151,38 @@ def process_and_embed_resume(resume_pdf_path, personal_info_txt_path, personal_i
         print(f"Info: Personal info file not found at '{personal_info_md_path}' or '{personal_info_txt_path}'. This is optional.")
 
     # 3. Check if we have any text at all
+    full_text = resume_text + personal_info_text
     if not full_text.strip():
         print("Error: No text found from resume or personal info file.")
         print(f"Please make sure '{resume_pdf_path}' or '{personal_info_md_path}' or '{personal_info_txt_path}' exists.")
-        return None, None
+        return None, None, None
         
     print(f"Processing combined text...")
     
-    # 4. Split into chunks
-    text_chunks = split_text_into_chunks(full_text, chunk_size, chunk_overlap)
-    print(f"Split text into {len(text_chunks)} chunks.")
+    # 4. Split into chunks, tracking which chunks come from personal_info
+    # First, chunk the resume text
+    resume_chunks = split_text_into_chunks(resume_text, chunk_size, chunk_overlap) if resume_text.strip() else []
+    resume_chunk_count = len(resume_chunks)
+    
+    # Then, chunk the personal info text
+    personal_info_chunks = split_text_into_chunks(personal_info_text, chunk_size, chunk_overlap) if personal_info_text.strip() else []
+    
+    # Combine chunks
+    text_chunks = resume_chunks + personal_info_chunks
+    
+    # Track which chunk indices come from personal_info
+    personal_info_chunk_indices = list(range(resume_chunk_count, len(text_chunks))) if personal_info_chunks else []
+    
+    # Extract name from resume (first chunk) or personal_info
+    extracted_name = None
+    if resume_chunks:
+        extracted_name = extract_name_from_text(resume_chunks[0])
+    if not extracted_name and personal_info_text:
+        extracted_name = extract_name_from_text(personal_info_text)
+    
+    print(f"Split text into {len(text_chunks)} chunks ({len(resume_chunks)} from resume, {len(personal_info_chunks)} from personal info).")
+    if extracted_name:
+        print(f"Extracted name: {extracted_name}")
 
     # 5. Create embeddings
     print(f"Creating embeddings using '{embedding_model}'. This will take a moment...")
@@ -140,24 +209,34 @@ def process_and_embed_resume(resume_pdf_path, personal_info_txt_path, personal_i
         np_embeddings = np.array(all_embeddings)
         np.save(embeddings_file, np_embeddings)
         
-        print("Successfully created and saved chunks and embeddings.")
-        return text_chunks, np_embeddings
+        # Save metadata (which chunks are from personal_info, and extracted name)
+        metadata = {
+            'personal_info_chunk_indices': personal_info_chunk_indices,
+            'extracted_name': extracted_name
+        }
+        with open(metadata_file, "w") as f:
+            json.dump(metadata, f)
+        
+        print("Successfully created and saved chunks, embeddings, and metadata.")
+        return text_chunks, np_embeddings, personal_info_chunk_indices, extracted_name
 
     except Exception as e:
         print(f"Error creating embeddings: {e}")
         print("Is Ollama running? Try 'ollama serve' in another terminal.")
-        return None, None
+        return None, None, None, None
 
 def load_data_from_disk(data_dir):
     """
     Loads processed chunks and embeddings from the data directory.
+    Returns text_chunks, all_embeddings, personal_info_chunk_indices, and extracted_name.
     """
     chunks_file = os.path.join(data_dir, "chunks.json")
     embeddings_file = os.path.join(data_dir, "embeddings.npy")
+    metadata_file = os.path.join(data_dir, "chunk_metadata.json")
     
     print(f"Loading existing data from '{data_dir}' directory...")
     if not os.path.exists(chunks_file) or not os.path.exists(embeddings_file):
-        return None, None
+        return None, None, None, None
 
     try:
         with open(chunks_file, "r") as f:
@@ -165,11 +244,25 @@ def load_data_from_disk(data_dir):
         
         all_embeddings = np.load(embeddings_file)
         
+        # Load metadata if it exists (for backward compatibility)
+        personal_info_chunk_indices = []
+        extracted_name = None
+        if os.path.exists(metadata_file):
+            try:
+                with open(metadata_file, "r") as f:
+                    metadata = json.load(f)
+                    personal_info_chunk_indices = metadata.get('personal_info_chunk_indices', [])
+                    extracted_name = metadata.get('extracted_name', None)
+            except Exception as e:
+                print(f"Warning: Could not load metadata: {e}. Personal info chunks may not be prioritized.")
+        
+        if extracted_name:
+            print(f"Loaded extracted name: {extracted_name}")
         print("Data loaded successfully.")
-        return text_chunks, all_embeddings
+        return text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name
     except Exception as e:
         print(f"Error loading data: {e}. Re-processing resume.")
-        return None, None
+        return None, None, None, None
 
 def cosine_similarity(v1, v2):
     """
@@ -300,10 +393,14 @@ class ContextManager:
         history_text = self.get_formatted_history()
         return estimate_tokens(history_text)
 
-def find_relevant_chunks(query_embedding, all_embeddings, text_chunks, k):
+def find_relevant_chunks(query_embedding, all_embeddings, text_chunks, k, personal_info_chunk_indices=None):
     """
     Finds the top-k most similar chunks to the query.
+    Always includes personal_info chunks to ensure important preferences/constraints are included.
     """
+    if personal_info_chunk_indices is None:
+        personal_info_chunk_indices = []
+    
     similarities = []
     for emb in all_embeddings:
         sim = cosine_similarity(query_embedding, emb)
@@ -312,8 +409,36 @@ def find_relevant_chunks(query_embedding, all_embeddings, text_chunks, k):
     # Get the indices of the top-k most similar chunks
     top_k_indices = np.argsort(similarities)[-k:][::-1]
     
+    # Always include personal_info chunks (they contain important constraints/preferences)
+    # Combine personal_info indices with top-k indices, removing duplicates
+    combined_indices = list(set(top_k_indices.tolist() + personal_info_chunk_indices))
+    
+    # If we have more chunks than k, prioritize:
+    # 1. Personal info chunks (always included)
+    # 2. Top-k most similar chunks
+    if len(combined_indices) > k:
+        # Start with personal_info chunks
+        result_indices = personal_info_chunk_indices.copy()
+        
+        # Add top-k chunks that aren't already in personal_info
+        for idx in top_k_indices:
+            if idx not in result_indices and len(result_indices) < k:
+                result_indices.append(idx)
+        
+        # If we still have room and personal_info chunks, fill with remaining top-k
+        remaining_slots = k - len(result_indices)
+        if remaining_slots > 0:
+            for idx in top_k_indices:
+                if idx not in result_indices:
+                    result_indices.append(idx)
+                    remaining_slots -= 1
+                    if remaining_slots == 0:
+                        break
+    else:
+        result_indices = combined_indices
+    
     # Return the text of those chunks
-    return [text_chunks[i] for i in top_k_indices]
+    return [text_chunks[i] for i in result_indices]
 
 def initialize_logging(logs_dir):
     """
@@ -434,20 +559,24 @@ def main():
     start_time = time.time()
     
     # 1. Load or create data (with reprocess logic)
-    text_chunks, all_embeddings = None, None
+    text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name = None, None, None, None
     if not args.reprocess:
-        text_chunks, all_embeddings = load_data_from_disk(data_dir)
+        text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name = load_data_from_disk(data_dir)
     
     if text_chunks is None or all_embeddings is None:
         if args.reprocess:
             print("\n--reprocess flag detected. Forcing file processing...")
-        text_chunks, all_embeddings = process_and_embed_resume(
+        text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name = process_and_embed_resume(
             resume_pdf_path, personal_info_txt_path, personal_info_md_path,
             data_dir, embedding_model, chunk_size, chunk_overlap
         )
         if text_chunks is None:
             print("Exiting due to error.")
             return
+    
+    # Ensure personal_info_chunk_indices is a list (for backward compatibility)
+    if personal_info_chunk_indices is None:
+        personal_info_chunk_indices = []
 
     end_time = time.time()
     print(f"\n--- Ready to chat! (Setup took {end_time - start_time:.2f}s) ---")
@@ -490,12 +619,13 @@ def main():
                 print(f"Error getting embedding for query: {e}")
                 continue
 
-            # 4. Find relevant resume chunks
+            # 4. Find relevant resume chunks (always includes personal_info chunks)
             relevant_chunks = find_relevant_chunks(
                 query_embedding, 
                 all_embeddings, 
                 text_chunks,
-                top_k_chunks
+                top_k_chunks,
+                personal_info_chunk_indices
             )
             
             # 5. Create the prompt
@@ -522,11 +652,18 @@ def main():
                     f"-----------------\n\n"
                 )
             
+            # Build the prompt with explicit name if available
+            name_reminder = ""
+            if extracted_name:
+                name_reminder = f"IMPORTANT: Your name is {extracted_name}. When asked for your name, say '{extracted_name}' directly - do not be evasive.\n\n"
+            
             full_prompt += (
-                f"Resume Context (source of truth - always refer to this for factual information):\n"
+                f"Your Background (this is information about YOU - the person speaking):\n"
                 f"-----------------\n"
                 f"{resume_context}\n"
                 f"-----------------\n\n"
+                f"{name_reminder}"
+                f"Remember: You ARE the person described above. Speak in first person about your own background and experience.\n\n"
                 f"Question: {question}\n\n"
                 f"Answer:"
             )
