@@ -10,28 +10,23 @@ import sys
 from datetime import datetime
 
 # --- CONFIGURATION ---
-RESUME_PDF_PATH = "YOUR_RESUME.pdf"
-PERSONAL_INFO_TXT_PATH = "personal_info.txt" # <-- Renamed for clarity
-PERSONAL_INFO_MD_PATH = "personal_info.md"   # <-- New MD path
+# Only CONFIG_FILE remains here as it's needed to read the config itself
 CONFIG_FILE = "config.ini"
-LLM_MODEL = "llama3"
-EMBEDDING_MODEL = "nomic-embed-text"
 
-# Context window management settings
-# These can be overridden in config.ini
-DEFAULT_MAX_HISTORY_TOKENS = 2000  # Maximum tokens for conversation history
-DEFAULT_MIN_RECENT_MESSAGES = 6    # Always keep at least this many recent messages (3 exchanges)
-DEFAULT_SUMMARY_THRESHOLD = 0.8    # Summarize when history exceeds this fraction of max tokens
-
-# We will store our processed data here
-DATA_DIR = "data"
-CHUNKS_FILE = os.path.join(DATA_DIR, "chunks.json")
-EMBEDDINGS_FILE = os.path.join(DATA_DIR, "embeddings.npy")
-
-# Logs directory for conversation logs
-LOGS_DIR = "logs"
-
-# --- Default prompt (if config.ini is missing) ---
+# Default values (used as fallbacks if config.ini is missing or incomplete)
+DEFAULT_RESUME_PDF_PATH = "YOUR_RESUME.pdf"
+DEFAULT_PERSONAL_INFO_TXT_PATH = "personal_info.txt"
+DEFAULT_PERSONAL_INFO_MD_PATH = "personal_info.md"
+DEFAULT_DATA_DIR = "data"
+DEFAULT_LOGS_DIR = "logs"
+DEFAULT_LLM_MODEL = "llama3"
+DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
+DEFAULT_MAX_HISTORY_TOKENS = 2000
+DEFAULT_MIN_RECENT_MESSAGES = 6
+DEFAULT_SUMMARY_THRESHOLD = 0.8
+DEFAULT_CHUNK_SIZE = 1500
+DEFAULT_CHUNK_OVERLAP = 200
+DEFAULT_TOP_K_CHUNKS = 3
 DEFAULT_SYSTEM_PROMPT = (
     "You are a professional vulnerability management engineer who is talking to a recruiter or hiring manager. "
     "Do not make up information. If the answer is not in the context, "
@@ -41,7 +36,7 @@ DEFAULT_SYSTEM_PROMPT = (
 # ---------------------
 
 
-def split_text_into_chunks(text, chunk_size=1500, overlap=200):
+def split_text_into_chunks(text, chunk_size, overlap):
     """
     Splits text into overlapping chunks without a library.
     """
@@ -56,90 +51,94 @@ def split_text_into_chunks(text, chunk_size=1500, overlap=200):
         start += chunk_size - overlap
     return chunks
 
-def process_and_embed_resume():
+def process_and_embed_resume(resume_pdf_path, personal_info_txt_path, personal_info_md_path, 
+                              data_dir, embedding_model, chunk_size, chunk_overlap):
     """
     Reads, chunks, and embeds the resume and personal info file.
     Saves chunks and embeddings to disk.
     """
+    chunks_file = os.path.join(data_dir, "chunks.json")
+    embeddings_file = os.path.join(data_dir, "embeddings.npy")
+    
     print("Checking for context files...")
     full_text = ""
     
     # 1. Read PDF
-    if os.path.exists(RESUME_PDF_PATH):
+    if os.path.exists(resume_pdf_path):
         try:
-            doc = fitz.open(RESUME_PDF_PATH)
+            doc = fitz.open(resume_pdf_path)
             for page in doc:
                 full_text += page.get_text() + "\n" # Add newline separator
             
-            print(f"Successfully read {len(doc)} pages from PDF '{RESUME_PDF_PATH}'.")
+            print(f"Successfully read {len(doc)} pages from PDF '{resume_pdf_path}'.")
             doc.close()
         except Exception as e:
-            print(f"Error reading PDF '{RESUME_PDF_PATH}': {e}")
+            print(f"Error reading PDF '{resume_pdf_path}': {e}")
             # We can continue if the other file exists
     else:
-        print(f"Warning: Resume file not found at '{RESUME_PDF_PATH}'.")
+        print(f"Warning: Resume file not found at '{resume_pdf_path}'.")
 
     # 2. Read personal info (MD or TXT)
     personal_file_found = False
     # Prioritize Markdown file
-    if os.path.exists(PERSONAL_INFO_MD_PATH):
+    if os.path.exists(personal_info_md_path):
         try:
-            with open(PERSONAL_INFO_MD_PATH, "r") as f:
+            with open(personal_info_md_path, "r") as f:
                 full_text += f.read()
-            print(f"Successfully read markdown file '{PERSONAL_INFO_MD_PATH}'.")
+            print(f"Successfully read markdown file '{personal_info_md_path}'.")
             personal_file_found = True
         except Exception as e:
-            print(f"Error reading markdown file '{PERSONAL_INFO_MD_PATH}': {e}")
+            print(f"Error reading markdown file '{personal_info_md_path}': {e}")
     
     # If no MD file, check for TXT file as fallback
-    if not personal_file_found and os.path.exists(PERSONAL_INFO_TXT_PATH):
+    if not personal_file_found and os.path.exists(personal_info_txt_path):
         try:
-            with open(PERSONAL_INFO_TXT_PATH, "r") as f:
+            with open(personal_info_txt_path, "r") as f:
                 full_text += f.read()
-            print(f"Successfully read text file '{PERSONAL_INFO_TXT_PATH}'.")
+            print(f"Successfully read text file '{personal_info_txt_path}'.")
             personal_file_found = True
         except Exception as e:
-            print(f"Error reading text file '{PERSONAL_INFO_TXT_PATH}': {e}")
+            print(f"Error reading text file '{personal_info_txt_path}': {e}")
 
     if not personal_file_found:
-        print(f"Info: Personal info file not found at '{PERSONAL_INFO_MD_PATH}' or '{PERSONAL_INFO_TXT_PATH}'. This is optional.")
+        print(f"Info: Personal info file not found at '{personal_info_md_path}' or '{personal_info_txt_path}'. This is optional.")
 
     # 3. Check if we have any text at all
     if not full_text.strip():
         print("Error: No text found from resume or personal info file.")
-        print(f"Please make sure '{RESUME_PDF_PATH}' or '{PERSONAL_INFO_MD_PATH}' or '{PERSONAL_INFO_TXT_PATH}' exists.")
+        print(f"Please make sure '{resume_pdf_path}' or '{personal_info_md_path}' or '{personal_info_txt_path}' exists.")
         return None, None
         
     print(f"Processing combined text...")
     
-    # 4. Split into chunks (was step 2)
-    text_chunks = split_text_into_chunks(full_text)
+    # 4. Split into chunks
+    text_chunks = split_text_into_chunks(full_text, chunk_size, chunk_overlap)
     print(f"Split text into {len(text_chunks)} chunks.")
 
-    # 5. Create embeddings (was step 3)
-    print(f"Creating embeddings using '{EMBEDDING_MODEL}'. This will take a moment...")
+    # 5. Create embeddings
+    print(f"Creating embeddings using '{embedding_model}'. This will take a moment...")
     all_embeddings = []
     
     # Ensure data directory exists
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(data_dir, exist_ok=True)
 
     try:
         for i, chunk in enumerate(text_chunks):
             # We call the ollama API directly
-            response = ollama.embeddings(model=EMBEDDING_MODEL, prompt=chunk)
+            response = ollama.embeddings(model=embedding_model, prompt=chunk)
             all_embeddings.append(response["embedding"])
             
             if (i + 1) % 10 == 0 or (i + 1) == len(text_chunks):
                 print(f"  ... processed chunk {i + 1}/{len(text_chunks)}")
         
-        # 6. Save to disk (was step 4)
+        # 6. Save to disk
         # Save chunks as JSON
-        with open(CHUNKS_FILE, "w") as f:
+        with open(chunks_file, "w") as f:
             json.dump(text_chunks, f)
             
         # Save embeddings as numpy array
         np_embeddings = np.array(all_embeddings)
-        np.save(EMBEDDINGS_FILE, np_embeddings)
+        np.save(embeddings_file, np_embeddings)
         
         print("Successfully created and saved chunks and embeddings.")
         return text_chunks, np_embeddings
@@ -149,19 +148,22 @@ def process_and_embed_resume():
         print("Is Ollama running? Try 'ollama serve' in another terminal.")
         return None, None
 
-def load_data_from_disk():
+def load_data_from_disk(data_dir):
     """
-    Loads processed chunks and embeddings from the 'data' directory.
+    Loads processed chunks and embeddings from the data directory.
     """
-    print("Loading existing data from 'data' directory...")
-    if not os.path.exists(CHUNKS_FILE) or not os.path.exists(EMBEDDINGS_FILE):
+    chunks_file = os.path.join(data_dir, "chunks.json")
+    embeddings_file = os.path.join(data_dir, "embeddings.npy")
+    
+    print(f"Loading existing data from '{data_dir}' directory...")
+    if not os.path.exists(chunks_file) or not os.path.exists(embeddings_file):
         return None, None
 
     try:
-        with open(CHUNKS_FILE, "r") as f:
+        with open(chunks_file, "r") as f:
             text_chunks = json.load(f)
         
-        all_embeddings = np.load(EMBEDDINGS_FILE)
+        all_embeddings = np.load(embeddings_file)
         
         print("Data loaded successfully.")
         return text_chunks, all_embeddings
@@ -203,10 +205,7 @@ class ContextManager:
     Ensures resume context is always preserved while managing history size.
     """
     
-    def __init__(self, max_history_tokens=DEFAULT_MAX_HISTORY_TOKENS,
-                 min_recent_messages=DEFAULT_MIN_RECENT_MESSAGES,
-                 summary_threshold=DEFAULT_SUMMARY_THRESHOLD,
-                 llm_model=LLM_MODEL):
+    def __init__(self, max_history_tokens, min_recent_messages, summary_threshold, llm_model):
         self.max_history_tokens = max_history_tokens
         self.min_recent_messages = min_recent_messages
         self.summary_threshold = summary_threshold
@@ -301,7 +300,7 @@ class ContextManager:
         history_text = self.get_formatted_history()
         return estimate_tokens(history_text)
 
-def find_relevant_chunks(query_embedding, all_embeddings, text_chunks, k=3):
+def find_relevant_chunks(query_embedding, all_embeddings, text_chunks, k):
     """
     Finds the top-k most similar chunks to the query.
     """
@@ -316,18 +315,18 @@ def find_relevant_chunks(query_embedding, all_embeddings, text_chunks, k=3):
     # Return the text of those chunks
     return [text_chunks[i] for i in top_k_indices]
 
-def initialize_logging():
+def initialize_logging(logs_dir):
     """
     Creates the logs directory and opens a timestamped log file for this session.
     Returns the file handle and filename.
     """
     # Create logs directory if it doesn't exist
-    os.makedirs(LOGS_DIR, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
     
     # Create timestamped filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_filename = f"conversation_{timestamp}.log"
-    log_filepath = os.path.join(LOGS_DIR, log_filename)
+    log_filepath = os.path.join(logs_dir, log_filename)
     
     # Open log file in append mode (though it will be new)
     log_file = open(log_filepath, 'a', encoding='utf-8')
@@ -367,48 +366,85 @@ def main():
     )
     args = parser.parse_args()
     
-    # --- New: Config Parsing ---
+    # --- Config Parsing ---
     config = configparser.ConfigParser()
     if not os.path.exists(CONFIG_FILE):
         print(f"'{CONFIG_FILE}' not found. Creating a default config file.")
         try:
-            config['Chatbot'] = {'SystemPrompt': DEFAULT_SYSTEM_PROMPT}
+            # Create default config with all sections
+            config['Files'] = {
+                'ResumePdfPath': DEFAULT_RESUME_PDF_PATH,
+                'PersonalInfoTxtPath': DEFAULT_PERSONAL_INFO_TXT_PATH,
+                'PersonalInfoMdPath': DEFAULT_PERSONAL_INFO_MD_PATH,
+                'DataDir': DEFAULT_DATA_DIR,
+                'LogsDir': DEFAULT_LOGS_DIR
+            }
+            config['Models'] = {
+                'LlmModel': DEFAULT_LLM_MODEL,
+                'EmbeddingModel': DEFAULT_EMBEDDING_MODEL
+            }
             config['Context'] = {
                 'MaxHistoryTokens': str(DEFAULT_MAX_HISTORY_TOKENS),
                 'MinRecentMessages': str(DEFAULT_MIN_RECENT_MESSAGES),
                 'SummaryThreshold': str(DEFAULT_SUMMARY_THRESHOLD)
             }
+            config['RAG'] = {
+                'ChunkSize': str(DEFAULT_CHUNK_SIZE),
+                'ChunkOverlap': str(DEFAULT_CHUNK_OVERLAP),
+                'TopKChunks': str(DEFAULT_TOP_K_CHUNKS)
+            }
+            config['Chatbot'] = {'SystemPrompt': DEFAULT_SYSTEM_PROMPT}
             with open(CONFIG_FILE, 'w') as configfile:
                 config.write(configfile)
             print(f"Default '{CONFIG_FILE}' created successfully.")
         except Exception as e:
             print(f"Error creating default config file: {e}")
-            print("Using hard-coded default prompt.")
+            print("Using hard-coded defaults.")
     else:
         try:
             config.read(CONFIG_FILE)
         except Exception as e:
-            print(f"Error reading '{CONFIG_FILE}': {e}. Using default prompt.")
+            print(f"Error reading '{CONFIG_FILE}': {e}. Using defaults.")
 
-    # Load the prompt, falling back to the default if it's missing
-    system_prompt = config.get('Chatbot', 'SystemPrompt', fallback=DEFAULT_SYSTEM_PROMPT)
+    # Load all configuration values with fallbacks
+    # Files section
+    resume_pdf_path = config.get('Files', 'ResumePdfPath', fallback=DEFAULT_RESUME_PDF_PATH)
+    personal_info_txt_path = config.get('Files', 'PersonalInfoTxtPath', fallback=DEFAULT_PERSONAL_INFO_TXT_PATH)
+    personal_info_md_path = config.get('Files', 'PersonalInfoMdPath', fallback=DEFAULT_PERSONAL_INFO_MD_PATH)
+    data_dir = config.get('Files', 'DataDir', fallback=DEFAULT_DATA_DIR)
+    logs_dir = config.get('Files', 'LogsDir', fallback=DEFAULT_LOGS_DIR)
     
-    # Load context management settings
+    # Models section
+    llm_model = config.get('Models', 'LlmModel', fallback=DEFAULT_LLM_MODEL)
+    embedding_model = config.get('Models', 'EmbeddingModel', fallback=DEFAULT_EMBEDDING_MODEL)
+    
+    # Context section
     max_history_tokens = config.getint('Context', 'MaxHistoryTokens', fallback=DEFAULT_MAX_HISTORY_TOKENS)
     min_recent_messages = config.getint('Context', 'MinRecentMessages', fallback=DEFAULT_MIN_RECENT_MESSAGES)
     summary_threshold = config.getfloat('Context', 'SummaryThreshold', fallback=DEFAULT_SUMMARY_THRESHOLD)
+    
+    # RAG section
+    chunk_size = config.getint('RAG', 'ChunkSize', fallback=DEFAULT_CHUNK_SIZE)
+    chunk_overlap = config.getint('RAG', 'ChunkOverlap', fallback=DEFAULT_CHUNK_OVERLAP)
+    top_k_chunks = config.getint('RAG', 'TopKChunks', fallback=DEFAULT_TOP_K_CHUNKS)
+    
+    # Chatbot section
+    system_prompt = config.get('Chatbot', 'SystemPrompt', fallback=DEFAULT_SYSTEM_PROMPT)
     
     start_time = time.time()
     
     # 1. Load or create data (with reprocess logic)
     text_chunks, all_embeddings = None, None
     if not args.reprocess:
-        text_chunks, all_embeddings = load_data_from_disk()
+        text_chunks, all_embeddings = load_data_from_disk(data_dir)
     
     if text_chunks is None or all_embeddings is None:
         if args.reprocess:
             print("\n--reprocess flag detected. Forcing file processing...")
-        text_chunks, all_embeddings = process_and_embed_resume()
+        text_chunks, all_embeddings = process_and_embed_resume(
+            resume_pdf_path, personal_info_txt_path, personal_info_md_path,
+            data_dir, embedding_model, chunk_size, chunk_overlap
+        )
         if text_chunks is None:
             print("Exiting due to error.")
             return
@@ -419,7 +455,7 @@ def main():
     print(f"Context management: Max history tokens={max_history_tokens}, Min recent messages={min_recent_messages}")
 
     # --- Initialize logging ---
-    log_file, log_filename = initialize_logging()
+    log_file, log_filename = initialize_logging(logs_dir)
     print(f"Conversation log: {log_filename}")
     
     # --- Create context manager to handle conversation history ---
@@ -427,7 +463,7 @@ def main():
         max_history_tokens=max_history_tokens,
         min_recent_messages=min_recent_messages,
         summary_threshold=summary_threshold,
-        llm_model=LLM_MODEL
+        llm_model=llm_model
     )
 
     # 2. Start the chat loop
@@ -446,7 +482,7 @@ def main():
             # 3. Get embedding for the question
             try:
                 query_response = ollama.embeddings(
-                    model=EMBEDDING_MODEL,
+                    model=embedding_model,
                     prompt=question
                 )
                 query_embedding = query_response["embedding"]
@@ -458,7 +494,8 @@ def main():
             relevant_chunks = find_relevant_chunks(
                 query_embedding, 
                 all_embeddings, 
-                text_chunks
+                text_chunks,
+                top_k_chunks
             )
             
             # 5. Create the prompt
@@ -498,7 +535,7 @@ def main():
             try:
                 # Use streaming response
                 response_stream = ollama.generate(
-                    model=LLM_MODEL,
+                    model=llm_model,
                     prompt=full_prompt,
                     stream=True
                 )
