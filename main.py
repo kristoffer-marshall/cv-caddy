@@ -35,6 +35,94 @@ from recruiter_tracker import RecruiterInfoTracker
 from logging_utils import initialize_logging, update_log_header, log_exchange
 
 
+def detect_quit_intent(user_input):
+    """
+    Detects if the user wants to quit/end the conversation.
+    Returns True if quit intent is detected, False otherwise.
+    """
+    if not user_input:
+        return False
+    
+    user_lower = user_input.lower().strip()
+    
+    # Direct quit commands
+    quit_commands = ['quit', 'exit', 'bye', 'goodbye', 'good bye', 'see ya', 'see you', 
+                     'talk later', 'gotta go', 'have to go', 'i have to go', 'i gotta go',
+                     'thanks bye', 'thanks goodbye', 'thank you bye', 'thank you goodbye',
+                     'that\'s all', "that's all", 'that is all', 'all done', 'we\'re done',
+                     "we're done", 'we are done', 'i\'m done', "i'm done", 'i am done',
+                     'end conversation', 'end chat', 'close', 'done', 'finished']
+    
+    # Check for exact matches
+    if user_lower in quit_commands:
+        return True
+    
+    # Check for phrases that indicate leaving
+    quit_phrases = [
+        'have to go', 'gotta go', 'got to go', 'need to go', 'should go',
+        'talk to you later', 'speak with you later', 'catch you later',
+        'thanks for', 'thank you for', 'appreciate your time',
+        'nice talking', 'nice chatting', 'nice speaking',
+        'take care', 'have a good', 'have a great', 'have a nice'
+    ]
+    
+    for phrase in quit_phrases:
+        if phrase in user_lower:
+            return True
+    
+    return False
+
+
+def generate_goodbye(llm_model, system_prompt, history_string, extracted_name, temperature, top_p):
+    """
+    Generates a natural goodbye message using the LLM.
+    """
+    goodbye_prompt = (
+        f"{system_prompt}\n\n"
+    )
+    
+    if history_string.strip():
+        goodbye_prompt += (
+            f"Conversation History:\n"
+            f"-----------------\n"
+            f"{history_string}\n"
+            f"-----------------\n\n"
+        )
+    
+    name_context = ""
+    if extracted_name:
+        name_context = f"Your name is {extracted_name}. "
+    
+    goodbye_prompt += (
+        f"{name_context}"
+        f"The recruiter is ending the conversation. Give them a natural, professional, "
+        f"and friendly goodbye. Thank them for their time, express interest in next steps, "
+        f"and keep it brief (1-2 sentences). Be warm but professional. "
+        f"Do NOT wrap your response in quotes - respond directly as if speaking.\n\n"
+    )
+    
+    try:
+        response = ollama.generate(
+            model=llm_model,
+            prompt=goodbye_prompt,
+            stream=False,
+            options={
+                'temperature': temperature,
+                'top_p': top_p
+            }
+        )
+        goodbye_text = response['response'].strip()
+        # Remove surrounding quotes if present
+        if goodbye_text.startswith('"') and goodbye_text.endswith('"'):
+            goodbye_text = goodbye_text[1:-1].strip()
+        elif goodbye_text.startswith("'") and goodbye_text.endswith("'"):
+            goodbye_text = goodbye_text[1:-1].strip()
+        return goodbye_text
+    except Exception as e:
+        # Fallback to a simple goodbye if LLM fails
+        return "Thank you so much for your time! I really appreciate the opportunity to speak with you. Looking forward to hearing about next steps."
+
+
 def main():
     """
     Main function to run the chatbot.
@@ -165,8 +253,18 @@ def main():
     try:
         while True:
             question = input("\n> ")
-            if question.lower().strip() == 'quit':
-                print("Goodbye!")
+            
+            # Check for quit intent
+            if detect_quit_intent(question):
+                # Generate a natural goodbye response
+                history_string = context_manager.get_formatted_history()
+                goodbye_message = generate_goodbye(
+                    llm_model, system_prompt, history_string, extracted_name, temperature, top_p
+                )
+                print(f"\n{goodbye_message}")
+                
+                # Log the goodbye exchange
+                log_exchange(log_file, question, goodbye_message)
                 break
             
             if not question.strip():
