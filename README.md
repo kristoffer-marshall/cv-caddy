@@ -178,8 +178,3 @@ relevant_chunks = find_relevant_chunks(
 
 **Outdated responses after updating resume**
 - Use the `--reprocess` flag to regenerate embeddings
-
-## License
-
-This project is provided as-is for personal use.
-

@@ -1,6 +1,6 @@
 personal_info*
-data/*
-logs/*
+data/
+logs/
 *.pdf
 config.ini
 
@@ -9,3 +9,7 @@ my-new-env/
 # Common convention, also good to ignore
 venv/
 .venv/
+
+# Bytecode and runtime files
+__pycache__/
+*.pyc

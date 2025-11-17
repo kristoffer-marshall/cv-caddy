@@ -24,7 +24,9 @@ from config import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_TOP_K_CHUNKS,
-    DEFAULT_SYSTEM_PROMPT
+    DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_P
 )
 from resume_processor import process_and_embed_resume, load_data_from_disk
 from rag import find_relevant_chunks
@@ -63,7 +65,9 @@ def main():
             }
             config['Models'] = {
                 'LlmModel': DEFAULT_LLM_MODEL,
-                'EmbeddingModel': DEFAULT_EMBEDDING_MODEL
+                'EmbeddingModel': DEFAULT_EMBEDDING_MODEL,
+                'Temperature': str(DEFAULT_TEMPERATURE),
+                'TopP': str(DEFAULT_TOP_P)
             }
             config['Context'] = {
                 'MaxHistoryTokens': str(DEFAULT_MAX_HISTORY_TOKENS),
@@ -99,6 +103,8 @@ def main():
     # Models section
     llm_model = config.get('Models', 'LlmModel', fallback=DEFAULT_LLM_MODEL)
     embedding_model = config.get('Models', 'EmbeddingModel', fallback=DEFAULT_EMBEDDING_MODEL)
+    temperature = config.getfloat('Models', 'Temperature', fallback=DEFAULT_TEMPERATURE)
+    top_p = config.getfloat('Models', 'TopP', fallback=DEFAULT_TOP_P)
     
     # Context section
     max_history_tokens = config.getint('Context', 'MaxHistoryTokens', fallback=DEFAULT_MAX_HISTORY_TOKENS)
@@ -215,24 +221,36 @@ def main():
             if extracted_name:
                 name_reminder = f"IMPORTANT: Your name is {extracted_name}. When asked for your name, say '{extracted_name}' directly - do not be evasive.\n\n"
             
+            # Check if question is about salary and add specific reminder
+            salary_reminder = ""
+            question_lower = question.lower()
+            if any(word in question_lower for word in ['salary', 'compensation', 'pay', 'wage', 'earn', 'requirement', 'expect', 'ballpark']):
+                salary_reminder = (
+                    "CRITICAL REMINDER: Do NOT provide your salary requirement, ballpark figure, or any specific salary amount. "
+                    "If asked about salary, politely deflect by saying you'd prefer to discuss compensation after learning more about the role, "
+                    "or that you're open to negotiation. Do not give specific numbers.\n\n"
+                )
+            
             full_prompt += (
-                f"Your Background (this is information about YOU - the person speaking):\n"
-                f"-----------------\n"
-                f"{resume_context}\n"
-                f"-----------------\n\n"
+                f"Your Background:\n"
+                f"{resume_context}\n\n"
                 f"{name_reminder}"
-                f"Remember: You ARE the person described above. Speak in first person about your own background and experience.\n\n"
-                f"Question: {question}\n\n"
-                f"Answer:"
+                f"{salary_reminder}"
+                f"Now, respond naturally to this question as if you're having a real conversation:\n\n"
+                f"{question}\n\n"
             )
 
             # 6. Call the LLM with the prompt
             try:
-                # Use streaming response
+                # Use streaming response with temperature and top_p for more natural responses
                 response_stream = ollama.generate(
                     model=llm_model,
                     prompt=full_prompt,
-                    stream=True
+                    stream=True,
+                    options={
+                        'temperature': temperature,
+                        'top_p': top_p
+                    }
                 )
                 
                 # Capture the full response for history
