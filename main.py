@@ -4,9 +4,11 @@ Main entry point for the resume chatbot application.
 import os
 import sys
 import time
+import random
 import argparse
 import configparser
 import ollama
+import threading
 from datetime import datetime
 
 from config import (
@@ -33,6 +35,139 @@ from rag import find_relevant_chunks
 from context_manager import ContextManager
 from recruiter_tracker import RecruiterInfoTracker
 from logging_utils import initialize_logging, update_log_header, log_exchange
+
+
+# ANSI color codes for terminal output
+class Colors:
+    """ANSI color codes for terminal output."""
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    
+    # Text colors
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    GRAY = '\033[90m'
+    WHITE = '\033[97m'
+    
+    # Background colors
+    BG_BLUE = '\033[104m'
+    BG_GRAY = '\033[100m'
+
+
+class TypingIndicator:
+    """Manages animated typing indicator for SMS mode."""
+    
+    def __init__(self):
+        self.is_typing = False
+        self.stop_event = threading.Event()
+        self.thread = None
+    
+    def start(self, initial_delay=0):
+        """
+        Start the typing indicator animation.
+        
+        Args:
+            initial_delay: Delay in seconds before starting the animation (for reading/processing time)
+        """
+        if initial_delay > 0:
+            # Wait for the initial delay before starting
+            time.sleep(initial_delay)
+        
+        self.is_typing = True
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._animate, daemon=True)
+        self.thread.start()
+    
+    def stop(self):
+        """Stop the typing indicator animation."""
+        self.is_typing = False
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=0.5)
+        # Clear the typing indicator line
+        print('\r' + ' ' * 50 + '\r', end='', flush=True)
+    
+    def _animate(self):
+        """Animate the typing indicator with random pauses."""
+        dots = ['.', '..', '...']
+        dot_index = 0
+        
+        while not self.stop_event.is_set():
+            # Display typing indicator
+            indicator = f"{Colors.GRAY}{dots[dot_index % len(dots)]}{Colors.RESET}"
+            print(f'\r{indicator}', end='', flush=True)
+            
+            # Random pause between 0.3 and 0.8 seconds
+            pause = random.uniform(0.3, 0.8)
+            if self.stop_event.wait(pause):
+                break
+            
+            dot_index += 1
+            
+            # Randomly pause typing (like human hesitation)
+            if random.random() < 0.15:  # 15% chance of pausing
+                pause_time = random.uniform(0.5, 1.5)
+                print('\r' + ' ' * 10 + '\r', end='', flush=True)
+                if self.stop_event.wait(pause_time):
+                    break
+
+
+def get_first_name(full_name):
+    """
+    Extract the first name from a full name.
+    
+    Args:
+        full_name: Full name string (e.g., "John Doe" or "John Michael Doe")
+    
+    Returns:
+        First name string, or None if full_name is None/empty
+    """
+    if not full_name:
+        return None
+    # Split by space and take the first part
+    name_parts = full_name.strip().split()
+    return name_parts[0] if name_parts else None
+
+
+def display_sms_message(message, is_user=False, sender_name=None):
+    """
+    Display a message in SMS/RCS style with colors.
+    
+    Args:
+        message: The message text to display
+        is_user: True if this is a user message, False if bot message
+        sender_name: Name to display for bot messages (defaults to "Them" if not provided)
+    """
+    if is_user:
+        # User messages: blue text, bold
+        print(f"{Colors.BLUE}{Colors.BOLD}You:{Colors.RESET} {message}")
+    else:
+        # Bot messages: gray text, subtle
+        display_name = sender_name if sender_name else "Them"
+        print(f"{Colors.GRAY}{display_name}:{Colors.RESET} {message}")
+
+
+def display_sms_response(response_text, typing_indicator, sender_name=None):
+    """
+    Display bot response in SMS style with typing simulation.
+    
+    Args:
+        response_text: The full response text
+        typing_indicator: TypingIndicator instance
+        sender_name: Name to display for bot messages (defaults to "Them" if not provided)
+    """
+    # Stop typing indicator
+    typing_indicator.stop()
+    
+    # Simulate human typing delay before showing message
+    # Random delay between 0.2 and 0.8 seconds
+    typing_delay = random.uniform(0.2, 0.8)
+    time.sleep(typing_delay)
+    
+    # Display the message
+    display_sms_message(response_text, is_user=False, sender_name=sender_name)
 
 
 def detect_quit_intent(user_input):
@@ -136,6 +271,12 @@ def main():
         action="store_true", 
         help="Force reprocessing of the resume and context files."
     )
+    parser.add_argument(
+        "-s",
+        "--sms",
+        action="store_true",
+        help="Enable SMS/RCS messaging mode with typing indicators."
+    )
     args = parser.parse_args()
     
     # --- Config Parsing ---
@@ -230,13 +371,23 @@ def main():
         personal_info_chunk_indices = []
 
     end_time = time.time()
-    print(f"\n--- Ready to chat! (Setup took {end_time - start_time:.2f}s) ---")
-    print("Ask any question about the resume. Type 'quit' to exit.")
-    print(f"Context management: Max history tokens={max_history_tokens}, Min recent messages={min_recent_messages}")
+    
+    # Display startup message based on mode
+    if args.sms:
+        print(f"\n{Colors.BOLD}{Colors.GREEN}📱 SMS Mode Enabled{Colors.RESET}")
+        print(f"{Colors.DIM}Ready to chat! (Setup took {end_time - start_time:.2f}s){Colors.RESET}")
+        print(f"{Colors.GRAY}Type your message and press Enter. Say 'bye' or 'quit' to exit.{Colors.RESET}\n")
+    else:
+        print(f"\n--- Ready to chat! (Setup took {end_time - start_time:.2f}s) ---")
+        print("Ask any question about the resume. Type 'quit' to exit.")
+        print(f"Context management: Max history tokens={max_history_tokens}, Min recent messages={min_recent_messages}")
 
     # --- Initialize logging ---
     log_file, log_filename, log_filepath = initialize_logging(logs_dir)
-    print(f"Conversation log: {log_filename}")
+    if not args.sms:
+        print(f"Conversation log: {log_filename}")
+    else:
+        print(f"{Colors.DIM}Conversation log: {log_filename}{Colors.RESET}")
     
     # --- Create recruiter info tracker ---
     recruiter_tracker = RecruiterInfoTracker(applicant_name=extracted_name)
@@ -248,20 +399,39 @@ def main():
         summary_threshold=summary_threshold,
         llm_model=llm_model
     )
+    
+    # --- Create typing indicator for SMS mode ---
+    typing_indicator = TypingIndicator() if args.sms else None
+    
+    # --- Extract first name for SMS display ---
+    first_name = get_first_name(extracted_name) if extracted_name else None
 
     # 2. Start the chat loop
     try:
         while True:
-            question = input("\n> ")
+            if args.sms:
+                question = input(f"{Colors.BLUE}{Colors.BOLD}You: {Colors.RESET}")
+            else:
+                question = input("\n> ")
             
             # Check for quit intent
             if detect_quit_intent(question):
                 # Generate a natural goodbye response
                 history_string = context_manager.get_formatted_history()
+                
+                if args.sms:
+                    # Show typing indicator for goodbye (short delay for reading)
+                    goodbye_reading_delay = random.uniform(0.3, 0.8)
+                    typing_indicator.start(initial_delay=goodbye_reading_delay)
+                
                 goodbye_message = generate_goodbye(
                     llm_model, system_prompt, history_string, extracted_name, temperature, top_p
                 )
-                print(f"\n{goodbye_message}")
+                
+                if args.sms:
+                    display_sms_response(goodbye_message, typing_indicator, sender_name=first_name)
+                else:
+                    print(f"\n{goodbye_message}")
                 
                 # Log the goodbye exchange
                 log_exchange(log_file, question, goodbye_message)
@@ -270,7 +440,20 @@ def main():
             if not question.strip():
                 continue
 
-            print("\nThinking...")
+            if not args.sms:
+                print("\nThinking...")
+            elif args.sms:
+                # Calculate reading delay based on message length
+                # Base delay: 0.3 seconds, plus 0.01 seconds per character (capped at reasonable max)
+                message_length = len(question)
+                reading_delay = 0.3 + (message_length * 0.01)
+                # Cap the delay between 0.3 and 2.0 seconds
+                reading_delay = min(max(reading_delay, 0.3), 2.0)
+                # Add some randomness (±20%)
+                reading_delay = reading_delay * random.uniform(0.8, 1.2)
+                
+                # Start typing indicator with reading delay
+                typing_indicator.start(initial_delay=reading_delay)
             
             # 3. Get embedding for the question
             try:
@@ -353,12 +536,22 @@ def main():
                 
                 # Capture the full response for history
                 full_response = ""
-                for chunk in response_stream:
-                    if not chunk['done']:
-                        response_part = chunk['response']
-                        print(response_part, end="", flush=True)
-                        full_response += response_part
-                print() # Newline after the full response
+                if args.sms:
+                    # In SMS mode, collect the full response first, then display it
+                    for chunk in response_stream:
+                        if not chunk['done']:
+                            response_part = chunk['response']
+                            full_response += response_part
+                    # Display with typing simulation
+                    display_sms_response(full_response.strip(), typing_indicator, sender_name=first_name)
+                else:
+                    # In normal mode, stream the response as it's generated
+                    for chunk in response_stream:
+                        if not chunk['done']:
+                            response_part = chunk['response']
+                            print(response_part, end="", flush=True)
+                            full_response += response_part
+                    print() # Newline after the full response
                 
                 # Add this exchange to context manager (handles windowing automatically)
                 context_manager.add_exchange(question, full_response.strip())
@@ -375,13 +568,23 @@ def main():
                 # Log this exchange
                 log_exchange(log_file, question, full_response.strip())
                 
-                # Optional: Show context stats (can be removed or made configurable)
-                history_tokens = context_manager.get_history_token_count()
-                if history_tokens > max_history_tokens * 0.7:
-                    print(f"\n[Context: {history_tokens}/{max_history_tokens} tokens used]")
+                # Optional: Show context stats (only in normal mode, not SMS)
+                if not args.sms:
+                    history_tokens = context_manager.get_history_token_count()
+                    if history_tokens > max_history_tokens * 0.7:
+                        print(f"\n[Context: {history_tokens}/{max_history_tokens} tokens used]")
 
             except Exception as e:
-                print(f"\nAn error occurred while generating the response: {e}")
+                # Stop typing indicator if it's running
+                if args.sms and typing_indicator:
+                    typing_indicator.stop()
+                
+                error_msg = f"An error occurred while generating the response: {e}"
+                if args.sms:
+                    print(f"\n{Colors.YELLOW}⚠ {error_msg}{Colors.RESET}")
+                else:
+                    print(f"\n{error_msg}")
+                
                 # Log the error
                 try:
                     error_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -391,7 +594,12 @@ def main():
                     pass  # Ignore logging errors
 
     except KeyboardInterrupt:
-        print("\nGoodbye!")
+        if args.sms:
+            if typing_indicator:
+                typing_indicator.stop()
+            print(f"\n{Colors.GRAY}Goodbye!{Colors.RESET}")
+        else:
+            print("\nGoodbye!")
     finally:
         # Always close the log file, whether normal exit or interrupt
         try:
