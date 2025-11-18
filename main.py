@@ -9,6 +9,7 @@ import argparse
 import configparser
 import ollama
 import threading
+import socket
 from datetime import datetime
 
 from config import (
@@ -258,6 +259,252 @@ def generate_goodbye(llm_model, system_prompt, history_string, extracted_name, t
         return "Thank you so much for your time! I really appreciate the opportunity to speak with you. Looking forward to hearing about next steps."
 
 
+def handle_telnet_client(client_socket, client_address, llm_model, embedding_model, system_prompt,
+                         text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
+                         context_manager, log_file, top_k_chunks, temperature, top_p, first_name):
+    """
+    Handle a single telnet client connection.
+    
+    Args:
+        client_socket: The socket connection to the client
+        client_address: Tuple of (host, port) for the client
+        llm_model: LLM model name
+        embedding_model: Embedding model name
+        system_prompt: System prompt for the chatbot
+        text_chunks: List of text chunks
+        all_embeddings: Numpy array of embeddings
+        personal_info_chunk_indices: List of indices for personal info chunks
+        extracted_name: Extracted name from resume
+        context_manager: ContextManager instance
+        log_file: Log file handle
+        top_k_chunks: Number of top chunks to retrieve
+        temperature: LLM temperature parameter
+        top_p: LLM top_p parameter
+        first_name: First name for display
+    """
+    try:
+        # Send welcome message
+        welcome_msg = "\r\nWelcome to the Resume Chatbot!\r\nType your questions below. Type 'quit' to exit.\r\n\r\n"
+        client_socket.sendall(welcome_msg.encode('utf-8'))
+        
+        # Create a new context manager for this client
+        client_context = ContextManager(
+            max_history_tokens=context_manager.max_history_tokens,
+            min_recent_messages=context_manager.min_recent_messages,
+            summary_threshold=context_manager.summary_threshold,
+            llm_model=context_manager.llm_model
+        )
+        
+        # Create a recruiter tracker for this client
+        client_recruiter_tracker = RecruiterInfoTracker(applicant_name=extracted_name)
+        
+        while True:
+            # Send prompt
+            client_socket.sendall(b"> ")
+            
+            # Receive input from client
+            question = ""
+            while True:
+                try:
+                    data = client_socket.recv(1024)
+                    if not data:
+                        return  # Client disconnected
+                    
+                    # Decode and handle line endings
+                    question += data.decode('utf-8', errors='ignore')
+                    if '\n' in question or '\r' in question:
+                        # Clean up line endings
+                        question = question.strip().replace('\r', '').replace('\n', '')
+                        break
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    print(f"Error receiving data from {client_address}: {e}")
+                    return
+            
+            if not question:
+                continue
+            
+            # Check for quit intent
+            if detect_quit_intent(question):
+                history_string = client_context.get_formatted_history()
+                goodbye_message = generate_goodbye(
+                    llm_model, system_prompt, history_string, extracted_name, temperature, top_p
+                )
+                client_socket.sendall(f"\r\n{goodbye_message}\r\n".encode('utf-8'))
+                log_exchange(log_file, question, goodbye_message)
+                break
+            
+            # Send "Thinking..." message
+            client_socket.sendall(b"\r\nThinking...\r\n")
+            
+            # Get embedding for the question
+            try:
+                query_response = ollama.embeddings(
+                    model=embedding_model,
+                    prompt=question
+                )
+                query_embedding = query_response["embedding"]
+            except Exception as e:
+                error_msg = f"\r\nError getting embedding for query: {e}\r\n"
+                client_socket.sendall(error_msg.encode('utf-8'))
+                continue
+            
+            # Find relevant resume chunks
+            relevant_chunks = find_relevant_chunks(
+                query_embedding,
+                all_embeddings,
+                text_chunks,
+                top_k_chunks,
+                personal_info_chunk_indices
+            )
+            
+            # Create the prompt
+            resume_context = "\n\n".join(relevant_chunks)
+            history_string = client_context.get_formatted_history()
+            
+            full_prompt = f"{system_prompt}\n\n"
+            
+            if history_string.strip():
+                full_prompt += (
+                    f"Conversation History:\n"
+                    f"-----------------\n"
+                    f"{history_string}\n"
+                    f"-----------------\n\n"
+                )
+            
+            name_reminder = ""
+            if extracted_name:
+                name_reminder = f"IMPORTANT: Your name is {extracted_name}. When asked for your name, say '{extracted_name}' directly - do not be evasive.\n\n"
+            
+            salary_reminder = ""
+            question_lower = question.lower()
+            if any(word in question_lower for word in ['salary', 'compensation', 'pay', 'wage', 'earn', 'requirement', 'expect', 'ballpark']):
+                salary_reminder = (
+                    "CRITICAL REMINDER: Do NOT provide your salary requirement, ballpark figure, or any specific salary amount. "
+                    "If asked about salary, politely deflect by saying you'd prefer to discuss compensation after learning more about the role, "
+                    "or that you're open to negotiation. Do not give specific numbers.\n\n"
+                )
+            
+            full_prompt += (
+                f"Your Background:\n"
+                f"{resume_context}\n\n"
+                f"{name_reminder}"
+                f"{salary_reminder}"
+                f"Now, respond naturally to this question as if you're having a real conversation:\n\n"
+                f"{question}\n\n"
+            )
+            
+            # Call the LLM
+            try:
+                response_stream = ollama.generate(
+                    model=llm_model,
+                    prompt=full_prompt,
+                    stream=True,
+                    options={
+                        'temperature': temperature,
+                        'top_p': top_p
+                    }
+                )
+                
+                # Stream response to client
+                full_response = ""
+                client_socket.sendall(b"\r\n")
+                for chunk in response_stream:
+                    if not chunk['done']:
+                        response_part = chunk['response']
+                        full_response += response_part
+                        client_socket.sendall(response_part.encode('utf-8'))
+                
+                client_socket.sendall(b"\r\n\r\n")
+                
+                # Add to context manager
+                client_context.add_exchange(question, full_response.strip())
+                
+                # Update recruiter tracker for this client
+                client_recruiter_tracker.extract_info(llm_model)
+                
+                # Log the exchange
+                log_exchange(log_file, question, full_response.strip())
+                
+            except Exception as e:
+                error_msg = f"\r\nError generating response: {e}\r\n"
+                client_socket.sendall(error_msg.encode('utf-8'))
+                
+    except Exception as e:
+        print(f"Error handling client {client_address}: {e}")
+    finally:
+        client_socket.close()
+        print(f"Client {client_address} disconnected")
+
+
+def run_telnet_server(port, llm_model, embedding_model, system_prompt,
+                     text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
+                     context_manager, log_file, top_k_chunks, temperature, top_p, first_name):
+    """
+    Run a telnet server that accepts connections and handles chatbot interactions.
+    
+    Args:
+        port: Port number to listen on
+        llm_model: LLM model name
+        embedding_model: Embedding model name
+        system_prompt: System prompt for the chatbot
+        text_chunks: List of text chunks
+        all_embeddings: Numpy array of embeddings
+        personal_info_chunk_indices: List of indices for personal info chunks
+        extracted_name: Extracted name from resume
+        context_manager: ContextManager instance (used as template for per-client contexts)
+        log_file: Log file handle
+        top_k_chunks: Number of top chunks to retrieve
+        temperature: LLM temperature parameter
+        top_p: LLM top_p parameter
+        first_name: First name for display
+    """
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    try:
+        server_socket.bind(('0.0.0.0', port))
+        server_socket.listen(5)
+        server_socket.settimeout(1.0)  # Allow periodic checking for interrupts
+        
+        print(f"\n{Colors.BOLD}{Colors.GREEN}🌐 Telnet Server Started{Colors.RESET}")
+        print(f"{Colors.DIM}Listening on port {port}...{Colors.RESET}")
+        print(f"{Colors.DIM}Connect with: telnet localhost {port}{Colors.RESET}")
+        print(f"{Colors.DIM}Press Ctrl+C to stop the server{Colors.RESET}\n")
+        
+        while True:
+            try:
+                client_socket, client_address = server_socket.accept()
+                client_socket.settimeout(30.0)  # Timeout for client operations
+                print(f"Client connected from {client_address[0]}:{client_address[1]}")
+                
+                # Handle client in a new thread
+                client_thread = threading.Thread(
+                    target=handle_telnet_client,
+                    args=(client_socket, client_address, llm_model, embedding_model, system_prompt,
+                          text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
+                          context_manager, log_file, top_k_chunks, temperature, top_p, first_name),
+                    daemon=True
+                )
+                client_thread.start()
+                
+            except socket.timeout:
+                # Timeout is expected, continue listening
+                continue
+            except KeyboardInterrupt:
+                print(f"\n{Colors.YELLOW}Shutting down telnet server...{Colors.RESET}")
+                break
+            except Exception as e:
+                print(f"Error accepting connection: {e}")
+                continue
+                
+    except Exception as e:
+        print(f"Error starting telnet server: {e}")
+    finally:
+        server_socket.close()
+
+
 def main():
     """
     Main function to run the chatbot.
@@ -276,6 +523,19 @@ def main():
         "--sms",
         action="store_true",
         help="Enable SMS/RCS messaging mode with typing indicators."
+    )
+    parser.add_argument(
+        "-t",
+        "--telnet",
+        action="store_true",
+        help="Enable telnet server mode."
+    )
+    parser.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        default=2323,
+        help="Port number for telnet server (default: 2323)."
     )
     args = parser.parse_args()
     
@@ -406,7 +666,34 @@ def main():
     # --- Extract first name for SMS display ---
     first_name = get_first_name(extracted_name) if extracted_name else None
 
-    # 2. Start the chat loop
+    # 2. Start the appropriate interface
+    if args.telnet:
+        # Run telnet server
+        try:
+            run_telnet_server(
+                args.port, llm_model, embedding_model, system_prompt,
+                text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
+                context_manager, log_file, top_k_chunks, temperature, top_p, first_name
+            )
+        except KeyboardInterrupt:
+            print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
+        finally:
+            # Close log file and update header
+            try:
+                recruiter_tracker.extract_info(llm_model)
+                if recruiter_tracker.has_any_info():
+                    update_log_header(log_filepath, recruiter_tracker)
+                
+                session_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                log_file.write(f"{'='*80}\n")
+                log_file.write(f"Telnet Server Session Ended: {session_end}\n")
+                log_file.write(f"{'='*80}\n")
+                log_file.close()
+            except:
+                pass  # Ignore errors when closing log file
+        return
+    
+    # 2. Start the chat loop (normal or SMS mode)
     try:
         while True:
             if args.sms:
