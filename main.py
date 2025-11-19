@@ -7,6 +7,7 @@ import time
 import random
 import argparse
 import configparser
+import signal
 import ollama
 import threading
 import socket
@@ -35,7 +36,8 @@ from config import (
     DEFAULT_MAX_REQUESTS_PER_MINUTE,
     DEFAULT_MAX_CONNECTIONS_PER_IP,
     DEFAULT_CONNECTION_TIMEOUT,
-    DEFAULT_IDLE_TIMEOUT
+    DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_SHUTDOWN_MESSAGE
 )
 from resume_processor import process_and_embed_resume, load_data_from_disk
 from rag import find_relevant_chunks
@@ -46,6 +48,11 @@ from security import (
     validate_input_length, sanitize_input, detect_prompt_injection,
     validate_file_path, RateLimiter, sanitize_error_message,
     MAX_INPUT_LENGTH, MAX_PROMPT_LENGTH
+)
+from daemon_utils import (
+    daemonize, setup_signal_handlers, check_shutdown_requested,
+    check_reload_requested, clear_reload_request, get_default_pid_file,
+    send_signal_to_daemon, read_pid_file
 )
 
 
@@ -587,7 +594,8 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                      text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
                      context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
                      initial_greeting_template, rate_limiter, bind_address='127.0.0.1', 
-                     connection_timeout=30.0, idle_timeout=300.0):
+                     connection_timeout=30.0, idle_timeout=300.0, shutdown_message=None,
+                     active_connections=None, server_socket_ref=None):
     """
     Run a telnet server that accepts connections and handles chatbot interactions.
     
@@ -611,9 +619,18 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
         bind_address: Address to bind to (default: 127.0.0.1 for localhost only)
         connection_timeout: Timeout for client operations in seconds (default: 30.0)
         idle_timeout: Idle timeout in seconds (default: 300.0)
+        shutdown_message: Message to send to active connections on shutdown
+        active_connections: List to track active connections for graceful shutdown
     """
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    # Store socket reference if provided (for reload/shutdown handling)
+    if server_socket_ref is not None:
+        server_socket_ref[0] = server_socket
+    
+    if active_connections is None:
+        active_connections = []
     
     # Warn if binding to all interfaces
     if bind_address == '0.0.0.0':
@@ -633,7 +650,7 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
             print(f"{Colors.DIM}Connect with: telnet {bind_address} {port}{Colors.RESET}")
         print(f"{Colors.DIM}Press Ctrl+C to stop the server{Colors.RESET}\n")
         
-        while True:
+        while not check_shutdown_requested():
             try:
                 client_socket, client_address = server_socket.accept()
                 client_socket.settimeout(connection_timeout)
@@ -649,13 +666,25 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                 
                 print(f"Client connected from {ip_address}:{client_address[1]}")
                 
+                # Track connection for graceful shutdown
+                active_connections.append(client_socket)
+                
                 # Handle client in a new thread
+                def client_handler_wrapper(sock, addr):
+                    try:
+                        handle_telnet_client(
+                            sock, addr, llm_model, embedding_model, system_prompt,
+                            text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
+                            context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
+                            initial_greeting_template, rate_limiter
+                        )
+                    finally:
+                        if sock in active_connections:
+                            active_connections.remove(sock)
+                
                 client_thread = threading.Thread(
-                    target=handle_telnet_client,
-                    args=(client_socket, client_address, llm_model, embedding_model, system_prompt,
-                          text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
-                          context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
-                          initial_greeting_template, rate_limiter),
+                    target=client_handler_wrapper,
+                    args=(client_socket, client_address),
                     daemon=True
                 )
                 client_thread.start()
@@ -667,13 +696,188 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                 print(f"\n{Colors.YELLOW}Shutting down telnet server...{Colors.RESET}")
                 break
             except Exception as e:
-                print(f"Error accepting connection: {e}")
+                if not check_shutdown_requested():
+                    print(f"Error accepting connection: {e}")
                 continue
+        
+        # Graceful shutdown: notify active connections
+        if shutdown_message and active_connections:
+            print(f"Notifying {len(active_connections)} active connections of shutdown...")
+            for conn in active_connections[:]:  # Copy list to avoid modification during iteration
+                try:
+                    conn.sendall(f"\r\n{shutdown_message}\r\n".encode('utf-8'))
+                except Exception:
+                    pass  # Connection may already be closed
+        
+        # Wait for connections to close (with timeout)
+        shutdown_timeout = 10.0  # seconds
+        start_time = time.time()
+        while active_connections and (time.time() - start_time) < shutdown_timeout:
+            time.sleep(0.5)
+        
+        if active_connections:
+            print(f"Force closing {len(active_connections)} remaining connections...")
+            for conn in active_connections:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
                 
     except Exception as e:
         print(f"Error starting telnet server: {e}")
     finally:
         server_socket.close()
+        print("Telnet server stopped.")
+
+
+def create_systemd_service_file():
+    """
+    Create a systemd service file for cv-caddy.
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if os.geteuid() != 0:
+        print("Error: --add-systemd requires root privileges. Please run with sudo.")
+        return False
+    
+    # Get script path and working directory
+    script_path = os.path.abspath(__file__)
+    working_dir = os.path.dirname(script_path)
+    python_exec = sys.executable
+    current_user = os.environ.get('SUDO_USER', os.getenv('USER', 'root'))
+    
+    service_content = f"""[Unit]
+Description=CV Caddy Resume Chatbot Service
+After=network.target
+
+[Service]
+Type=simple
+User={current_user}
+WorkingDirectory={working_dir}
+ExecStart={python_exec} {script_path} --telnet
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cv-caddy
+
+[Install]
+WantedBy=multi-user.target
+"""
+    
+    service_file = '/etc/systemd/system/cv-caddy.service'
+    
+    try:
+        with open(service_file, 'w') as f:
+            f.write(service_content)
+        
+        # Set proper permissions
+        os.chmod(service_file, 0o644)
+        
+        print(f"Systemd service file created: {service_file}")
+        print("\nNext steps:")
+        print("  1. Run: sudo systemctl daemon-reload")
+        print("  2. Run: sudo systemctl enable cv-caddy  (to start on boot)")
+        print("  3. Run: sudo systemctl start cv-caddy   (to start now)")
+        print("\nService management commands:")
+        print("  sudo systemctl start cv-caddy")
+        print("  sudo systemctl stop cv-caddy")
+        print("  sudo systemctl restart cv-caddy")
+        print("  sudo systemctl status cv-caddy")
+        print("  sudo systemctl reload cv-caddy  (sends SIGHUP)")
+        
+        return True
+    except Exception as e:
+        print(f"Error creating systemd service file: {e}")
+        return False
+
+
+def reload_config_and_data(config, args, data_dir, embedding_model, chunk_size, chunk_overlap,
+                           resume_pdf_path, personal_info_txt_path, personal_info_md_path):
+    """
+    Reload configuration and reprocess resume data.
+    
+    Returns:
+        tuple: (text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
+                config_values_dict) or None on error
+    """
+    try:
+        # Reload config file
+        config.read(CONFIG_FILE)
+        
+        # Reload all config values
+        resume_pdf_path = config.get('Files', 'ResumePdfPath', fallback=DEFAULT_RESUME_PDF_PATH)
+        personal_info_txt_path = config.get('Files', 'PersonalInfoTxtPath', fallback=DEFAULT_PERSONAL_INFO_TXT_PATH)
+        personal_info_md_path = config.get('Files', 'PersonalInfoMdPath', fallback=DEFAULT_PERSONAL_INFO_MD_PATH)
+        data_dir = config.get('Files', 'DataDir', fallback=DEFAULT_DATA_DIR)
+        
+        llm_model = config.get('Models', 'LlmModel', fallback=DEFAULT_LLM_MODEL)
+        embedding_model = config.get('Models', 'EmbeddingModel', fallback=DEFAULT_EMBEDDING_MODEL)
+        temperature = config.getfloat('Models', 'Temperature', fallback=DEFAULT_TEMPERATURE)
+        top_p = config.getfloat('Models', 'TopP', fallback=DEFAULT_TOP_P)
+        
+        max_history_tokens = config.getint('Context', 'MaxHistoryTokens', fallback=DEFAULT_MAX_HISTORY_TOKENS)
+        min_recent_messages = config.getint('Context', 'MinRecentMessages', fallback=DEFAULT_MIN_RECENT_MESSAGES)
+        summary_threshold = config.getfloat('Context', 'SummaryThreshold', fallback=DEFAULT_SUMMARY_THRESHOLD)
+        
+        chunk_size = config.getint('RAG', 'ChunkSize', fallback=DEFAULT_CHUNK_SIZE)
+        chunk_overlap = config.getint('RAG', 'ChunkOverlap', fallback=DEFAULT_CHUNK_OVERLAP)
+        top_k_chunks = config.getint('RAG', 'TopKChunks', fallback=DEFAULT_TOP_K_CHUNKS)
+        
+        system_prompt = config.get('Chatbot', 'SystemPrompt', fallback=DEFAULT_SYSTEM_PROMPT)
+        initial_greeting_template = config.get('Chatbot', 'InitialGreeting', fallback=DEFAULT_INITIAL_GREETING)
+        
+        bind_address = config.get('Security', 'BindAddress', fallback=DEFAULT_BIND_ADDRESS)
+        max_requests_per_minute = config.getint('Security', 'MaxRequestsPerMinute', fallback=DEFAULT_MAX_REQUESTS_PER_MINUTE)
+        max_connections_per_ip = config.getint('Security', 'MaxConnectionsPerIP', fallback=DEFAULT_MAX_CONNECTIONS_PER_IP)
+        connection_timeout = config.getfloat('Security', 'ConnectionTimeout', fallback=DEFAULT_CONNECTION_TIMEOUT)
+        idle_timeout = config.getfloat('Security', 'IdleTimeout', fallback=DEFAULT_IDLE_TIMEOUT)
+        
+        shutdown_message = config.get('Chatbot', 'ShutdownMessage', fallback=DEFAULT_SHUTDOWN_MESSAGE)
+        
+        # Reprocess resume
+        print("Reloading: Reprocessing resume...")
+        text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name = process_and_embed_resume(
+            resume_pdf_path, personal_info_txt_path, personal_info_md_path,
+            data_dir, embedding_model, chunk_size, chunk_overlap
+        )
+        
+        if text_chunks is None:
+            print("Error: Failed to reprocess resume during reload")
+            return None
+        
+        config_values = {
+            'resume_pdf_path': resume_pdf_path,
+            'personal_info_txt_path': personal_info_txt_path,
+            'personal_info_md_path': personal_info_md_path,
+            'data_dir': data_dir,
+            'llm_model': llm_model,
+            'embedding_model': embedding_model,
+            'temperature': temperature,
+            'top_p': top_p,
+            'max_history_tokens': max_history_tokens,
+            'min_recent_messages': min_recent_messages,
+            'summary_threshold': summary_threshold,
+            'chunk_size': chunk_size,
+            'chunk_overlap': chunk_overlap,
+            'top_k_chunks': top_k_chunks,
+            'system_prompt': system_prompt,
+            'initial_greeting_template': initial_greeting_template,
+            'bind_address': bind_address,
+            'max_requests_per_minute': max_requests_per_minute,
+            'max_connections_per_ip': max_connections_per_ip,
+            'connection_timeout': connection_timeout,
+            'idle_timeout': idle_timeout,
+            'shutdown_message': shutdown_message
+        }
+        
+        print("Reload: Configuration and data reloaded successfully")
+        return (text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name, config_values)
+        
+    except Exception as e:
+        print(f"Error during reload: {e}")
+        return None
 
 
 def main():
@@ -708,7 +912,63 @@ def main():
         default=2323,
         help="Port number for telnet server (default: 2323)."
     )
+    parser.add_argument(
+        "-d",
+        "--daemon",
+        action="store_true",
+        help="Run as a daemon (background process). Requires --telnet mode."
+    )
+    parser.add_argument(
+        "--pid-file",
+        type=str,
+        default=None,
+        help="Path to PID file (default: /var/run/cv-caddy.pid if root, ./cv-caddy.pid otherwise)."
+    )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="Send SIGHUP to running daemon to reload configuration and reprocess resume."
+    )
+    parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Send SIGTERM to running daemon to stop gracefully."
+    )
+    parser.add_argument(
+        "--add-systemd",
+        action="store_true",
+        help="Create systemd service file (requires root/sudo)."
+    )
     args = parser.parse_args()
+    
+    # Handle --add-systemd (must be done before anything else)
+    if args.add_systemd:
+        if create_systemd_service_file():
+            sys.exit(0)
+        else:
+            sys.exit(1)
+    
+    # Handle --reload and --stop commands
+    pid_file_path = args.pid_file if args.pid_file else get_default_pid_file()
+    
+    if args.reload:
+        if send_signal_to_daemon(pid_file_path, signal.SIGHUP):
+            print("Reload signal sent to daemon")
+            sys.exit(0)
+        else:
+            sys.exit(1)
+    
+    if args.stop:
+        if send_signal_to_daemon(pid_file_path, signal.SIGTERM):
+            print("Stop signal sent to daemon")
+            sys.exit(0)
+        else:
+            sys.exit(1)
+    
+    # Validate daemon mode requirements
+    if args.daemon and not args.telnet:
+        print("Error: --daemon requires --telnet mode")
+        sys.exit(1)
     
     # --- Config Parsing ---
     config = configparser.ConfigParser()
@@ -741,7 +1001,8 @@ def main():
             }
             config['Chatbot'] = {
                 'SystemPrompt': DEFAULT_SYSTEM_PROMPT,
-                'InitialGreeting': DEFAULT_INITIAL_GREETING
+                'InitialGreeting': DEFAULT_INITIAL_GREETING,
+                'ShutdownMessage': DEFAULT_SHUTDOWN_MESSAGE
             }
             config['Security'] = {
                 'BindAddress': DEFAULT_BIND_ADDRESS,
@@ -789,6 +1050,7 @@ def main():
     # Chatbot section
     system_prompt = config.get('Chatbot', 'SystemPrompt', fallback=DEFAULT_SYSTEM_PROMPT)
     initial_greeting_template = config.get('Chatbot', 'InitialGreeting', fallback=DEFAULT_INITIAL_GREETING)
+    shutdown_message = config.get('Chatbot', 'ShutdownMessage', fallback=DEFAULT_SHUTDOWN_MESSAGE)
     
     # Security section
     bind_address = config.get('Security', 'BindAddress', fallback=DEFAULT_BIND_ADDRESS)
@@ -864,30 +1126,155 @@ def main():
 
     # 2. Start the appropriate interface
     if args.telnet:
-        # Run telnet server
-        try:
-            run_telnet_server(
-                args.port, llm_model, embedding_model, system_prompt,
-                text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
-                context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
-                initial_greeting_template, rate_limiter, bind_address, connection_timeout, idle_timeout
-            )
-        except KeyboardInterrupt:
-            print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
-        finally:
-            # Close log file and update header
-            try:
-                recruiter_tracker.extract_info(llm_model)
-                if recruiter_tracker.has_any_info():
-                    update_log_header(log_filepath, recruiter_tracker)
+        # Daemonize if requested (but not if running under systemd)
+        # Check if running under systemd by looking for NOTIFY_SOCKET environment variable
+        is_systemd = os.environ.get('NOTIFY_SOCKET') is not None
+        
+        if args.daemon and not is_systemd:
+            if not daemonize(pid_file_path, logs_dir):
+                print("Error: Failed to daemonize")
+                sys.exit(1)
+            print(f"Daemon started with PID {os.getpid()}")
+            print(f"PID file: {pid_file_path}")
+        elif args.daemon and is_systemd:
+            print("Note: Running under systemd, daemonization skipped (systemd handles process management)")
+        
+        # Set up signal handlers
+        active_connections = []
+        server_socket_ref = [None]  # Use list to allow modification in nested functions
+        
+        def shutdown_handler():
+            """Handle shutdown signal."""
+            print("\nShutdown requested, closing server...")
+            if server_socket_ref[0]:
+                try:
+                    server_socket_ref[0].close()
+                except Exception:
+                    pass
+        
+        def reload_handler():
+            """Handle reload signal."""
+            print("\nReload requested...")
+            # Reload will be handled in the main loop
+        
+        setup_signal_handlers(shutdown_handler, reload_handler)
+        
+        # Main server loop with reload support
+        while not check_shutdown_requested():
+            # Check for reload request
+            if check_reload_requested():
+                clear_reload_request()
+                print("Reloading configuration and reprocessing resume...")
                 
-                session_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                log_file.write(f"{'='*80}\n")
-                log_file.write(f"Telnet Server Session Ended: {session_end}\n")
-                log_file.write(f"{'='*80}\n")
-                log_file.close()
-            except:
-                pass  # Ignore errors when closing log file
+                # Reload config and data
+                reload_result = reload_config_and_data(
+                    config, args, data_dir, embedding_model, chunk_size, chunk_overlap,
+                    resume_pdf_path, personal_info_txt_path, personal_info_md_path
+                )
+                
+                if reload_result:
+                    text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name, config_vals = reload_result
+                    
+                    # Update configuration values
+                    llm_model = config_vals['llm_model']
+                    embedding_model = config_vals['embedding_model']
+                    temperature = config_vals['temperature']
+                    top_p = config_vals['top_p']
+                    max_history_tokens = config_vals['max_history_tokens']
+                    min_recent_messages = config_vals['min_recent_messages']
+                    summary_threshold = config_vals['summary_threshold']
+                    chunk_size = config_vals['chunk_size']
+                    chunk_overlap = config_vals['chunk_overlap']
+                    top_k_chunks = config_vals['top_k_chunks']
+                    system_prompt = config_vals['system_prompt']
+                    initial_greeting_template = config_vals['initial_greeting_template']
+                    bind_address = config_vals['bind_address']
+                    max_requests_per_minute = config_vals['max_requests_per_minute']
+                    max_connections_per_ip = config_vals['max_connections_per_ip']
+                    connection_timeout = config_vals['connection_timeout']
+                    idle_timeout = config_vals['idle_timeout']
+                    shutdown_message = config_vals['shutdown_message']
+                    
+                    # Reinitialize rate limiter
+                    rate_limiter = RateLimiter(
+                        max_requests=max_requests_per_minute,
+                        window_seconds=60,
+                        max_connections=max_connections_per_ip
+                    )
+                    
+                    # Reinitialize context manager
+                    context_manager = ContextManager(
+                        max_history_tokens=max_history_tokens,
+                        min_recent_messages=min_recent_messages,
+                        summary_threshold=summary_threshold,
+                        llm_model=llm_model
+                    )
+                    
+                    # Close old log file and open new one
+                    try:
+                        log_file.close()
+                    except Exception:
+                        pass
+                    log_file, log_filename, log_filepath = initialize_logging(logs_dir)
+                    
+                    print("Reload complete, restarting server...")
+                    # Close existing server socket
+                    if server_socket_ref[0]:
+                        try:
+                            server_socket_ref[0].close()
+                        except Exception:
+                            pass
+                        server_socket_ref[0] = None
+                else:
+                    print("Reload failed, continuing with existing configuration")
+            
+            # Run telnet server
+            try:
+                run_telnet_server(
+                    args.port, llm_model, embedding_model, system_prompt,
+                    text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
+                    context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
+                    initial_greeting_template, rate_limiter, bind_address, connection_timeout, 
+                    idle_timeout, shutdown_message, active_connections, server_socket_ref
+                )
+                
+                # If server exits normally (not due to shutdown), wait a bit before restarting
+                if not check_shutdown_requested():
+                    print("Server exited unexpectedly, waiting before restart...")
+                    time.sleep(2)
+                
+            except KeyboardInterrupt:
+                if not args.daemon and not is_systemd:
+                    print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
+                break
+            except Exception as e:
+                if not check_shutdown_requested():
+                    print(f"Error in server: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    time.sleep(5)  # Wait before retrying
+                else:
+                    break
+        
+        # Cleanup
+        try:
+            recruiter_tracker.extract_info(llm_model)
+            if recruiter_tracker.has_any_info():
+                update_log_header(log_filepath, recruiter_tracker)
+            
+            session_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_file.write(f"{'='*80}\n")
+            log_file.write(f"Telnet Server Session Ended: {session_end}\n")
+            log_file.write(f"{'='*80}\n")
+            log_file.close()
+        except:
+            pass  # Ignore errors when closing log file
+        
+        # Remove PID file if daemon
+        if args.daemon:
+            from daemon_utils import remove_pid_file
+            remove_pid_file(pid_file_path)
+        
         return
     
     # 2. Start the chat loop (normal or SMS mode)
