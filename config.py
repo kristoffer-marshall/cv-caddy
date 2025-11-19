@@ -26,4 +26,5 @@ DEFAULT_SYSTEM_PROMPT = (
     "You are talking to a recruiter. Provide your name directly when asked - do not be evasive. "
     "Do not make up information. If unsure, say so politely. Act casual and natural."
 )
+DEFAULT_INITIAL_GREETING = "Hi, my name is ${NAME}! Are you here to interview me?"
 

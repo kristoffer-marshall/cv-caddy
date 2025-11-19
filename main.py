@@ -29,7 +29,8 @@ from config import (
     DEFAULT_TOP_K_CHUNKS,
     DEFAULT_SYSTEM_PROMPT,
     DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_P
+    DEFAULT_TOP_P,
+    DEFAULT_INITIAL_GREETING
 )
 from resume_processor import process_and_embed_resume, load_data_from_disk
 from rag import find_relevant_chunks
@@ -209,6 +210,91 @@ def detect_quit_intent(user_input):
     return False
 
 
+def generate_initial_greeting(llm_model, system_prompt, greeting_template, extracted_name, 
+                              text_chunks, all_embeddings, personal_info_chunk_indices, 
+                              top_k_chunks, embedding_model, temperature, top_p):
+    """
+    Generates a natural initial greeting message using the LLM.
+    Uses the greeting template from config, replacing ${NAME} with the extracted name.
+    """
+    # Replace ${NAME} placeholder with actual name
+    if extracted_name and "${NAME}" in greeting_template:
+        greeting_prompt_text = greeting_template.replace("${NAME}", extracted_name)
+    elif extracted_name:
+        # If name exists but no placeholder, append it naturally
+        greeting_prompt_text = f"{greeting_template} (Your name is {extracted_name})"
+    else:
+        greeting_prompt_text = greeting_template.replace("${NAME}", "there")
+    
+    # Get relevant resume chunks for context
+    try:
+        # Use a simple query to get relevant context
+        query_response = ollama.embeddings(
+            model=embedding_model,
+            prompt="introduction greeting name"
+        )
+        query_embedding = query_response["embedding"]
+        
+        relevant_chunks = find_relevant_chunks(
+            query_embedding,
+            all_embeddings,
+            text_chunks,
+            top_k_chunks,
+            personal_info_chunk_indices
+        )
+        resume_context = "\n\n".join(relevant_chunks)
+    except Exception as e:
+        # If embedding fails, use empty context
+        resume_context = ""
+    
+    name_context = ""
+    if extracted_name:
+        name_context = f"Your name is {extracted_name}. "
+    
+    initial_prompt = (
+        f"{system_prompt}\n\n"
+    )
+    
+    if resume_context:
+        initial_prompt += (
+            f"Your Background:\n"
+            f"{resume_context}\n\n"
+        )
+    
+    initial_prompt += (
+        f"{name_context}"
+        f"You are starting a conversation with a recruiter or hiring manager. "
+        f"Say the following greeting naturally and conversationally: \"{greeting_prompt_text}\" "
+        f"Make it sound natural and friendly, as if you're actually greeting someone. "
+        f"Do NOT wrap your response in quotes - respond directly as if speaking. "
+        f"Keep it brief and natural (1-2 sentences).\n\n"
+    )
+    
+    try:
+        response = ollama.generate(
+            model=llm_model,
+            prompt=initial_prompt,
+            stream=False,
+            options={
+                'temperature': temperature,
+                'top_p': top_p
+            }
+        )
+        greeting_text = response['response'].strip()
+        # Remove surrounding quotes if present
+        if greeting_text.startswith('"') and greeting_text.endswith('"'):
+            greeting_text = greeting_text[1:-1].strip()
+        elif greeting_text.startswith("'") and greeting_text.endswith("'"):
+            greeting_text = greeting_text[1:-1].strip()
+        return greeting_text
+    except Exception as e:
+        # Fallback to template with name replacement
+        if extracted_name:
+            return greeting_template.replace("${NAME}", extracted_name)
+        else:
+            return greeting_template.replace("${NAME}", "there")
+
+
 def generate_goodbye(llm_model, system_prompt, history_string, extracted_name, temperature, top_p):
     """
     Generates a natural goodbye message using the LLM.
@@ -261,7 +347,8 @@ def generate_goodbye(llm_model, system_prompt, history_string, extracted_name, t
 
 def handle_telnet_client(client_socket, client_address, llm_model, embedding_model, system_prompt,
                          text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
-                         context_manager, log_file, top_k_chunks, temperature, top_p, first_name):
+                         context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
+                         initial_greeting_template):
     """
     Handle a single telnet client connection.
     
@@ -281,12 +368,9 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
         temperature: LLM temperature parameter
         top_p: LLM top_p parameter
         first_name: First name for display
+        initial_greeting_template: Template for initial greeting (may contain ${NAME})
     """
     try:
-        # Send welcome message
-        welcome_msg = "\r\nWelcome to the Resume Chatbot!\r\nType your questions below. Type 'quit' to exit.\r\n\r\n"
-        client_socket.sendall(welcome_msg.encode('utf-8'))
-        
         # Create a new context manager for this client
         client_context = ContextManager(
             max_history_tokens=context_manager.max_history_tokens,
@@ -297,6 +381,24 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
         
         # Create a recruiter tracker for this client
         client_recruiter_tracker = RecruiterInfoTracker(applicant_name=extracted_name)
+        
+        # Send "Thinking..." message
+        client_socket.sendall(b"\r\nThinking...\r\n")
+        
+        # Generate and send initial greeting
+        initial_greeting = generate_initial_greeting(
+            llm_model, system_prompt, initial_greeting_template, extracted_name,
+            text_chunks, all_embeddings, personal_info_chunk_indices,
+            top_k_chunks, embedding_model, temperature, top_p
+        )
+        client_socket.sendall(f"\r\n{initial_greeting}\r\n\r\n".encode('utf-8'))
+        
+        # Add initial greeting to context manager so it's remembered
+        # We add it as a Bot message with an empty User message to represent the start
+        client_context.history.append(("Bot", initial_greeting))
+        
+        # Log the initial greeting
+        log_exchange(log_file, "[Conversation started]", initial_greeting)
         
         while True:
             # Send prompt
@@ -440,7 +542,8 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
 
 def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                      text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
-                     context_manager, log_file, top_k_chunks, temperature, top_p, first_name):
+                     context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
+                     initial_greeting_template):
     """
     Run a telnet server that accepts connections and handles chatbot interactions.
     
@@ -459,6 +562,7 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
         temperature: LLM temperature parameter
         top_p: LLM top_p parameter
         first_name: First name for display
+        initial_greeting_template: Template for initial greeting (may contain ${NAME})
     """
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -484,7 +588,8 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                     target=handle_telnet_client,
                     args=(client_socket, client_address, llm_model, embedding_model, system_prompt,
                           text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
-                          context_manager, log_file, top_k_chunks, temperature, top_p, first_name),
+                          context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
+                          initial_greeting_template),
                     daemon=True
                 )
                 client_thread.start()
@@ -568,7 +673,10 @@ def main():
                 'ChunkOverlap': str(DEFAULT_CHUNK_OVERLAP),
                 'TopKChunks': str(DEFAULT_TOP_K_CHUNKS)
             }
-            config['Chatbot'] = {'SystemPrompt': DEFAULT_SYSTEM_PROMPT}
+            config['Chatbot'] = {
+                'SystemPrompt': DEFAULT_SYSTEM_PROMPT,
+                'InitialGreeting': DEFAULT_INITIAL_GREETING
+            }
             with open(CONFIG_FILE, 'w') as configfile:
                 config.write(configfile)
             print(f"Default '{CONFIG_FILE}' created successfully.")
@@ -607,6 +715,7 @@ def main():
     
     # Chatbot section
     system_prompt = config.get('Chatbot', 'SystemPrompt', fallback=DEFAULT_SYSTEM_PROMPT)
+    initial_greeting_template = config.get('Chatbot', 'InitialGreeting', fallback=DEFAULT_INITIAL_GREETING)
     
     start_time = time.time()
     
@@ -673,7 +782,8 @@ def main():
             run_telnet_server(
                 args.port, llm_model, embedding_model, system_prompt,
                 text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
-                context_manager, log_file, top_k_chunks, temperature, top_p, first_name
+                context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
+                initial_greeting_template
             )
         except KeyboardInterrupt:
             print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
@@ -695,6 +805,28 @@ def main():
     
     # 2. Start the chat loop (normal or SMS mode)
     try:
+        # Show "Thinking..." message
+        if not args.sms:
+            print("\nThinking...")
+        
+        # Generate and display initial greeting
+        initial_greeting = generate_initial_greeting(
+            llm_model, system_prompt, initial_greeting_template, extracted_name,
+            text_chunks, all_embeddings, personal_info_chunk_indices,
+            top_k_chunks, embedding_model, temperature, top_p
+        )
+        
+        if args.sms:
+            display_sms_message(initial_greeting, is_user=False, sender_name=first_name)
+        else:
+            print(f"\n{initial_greeting}\n")
+        
+        # Add initial greeting to context manager so it's remembered
+        context_manager.history.append(("Bot", initial_greeting))
+        
+        # Log the initial greeting
+        log_exchange(log_file, "[Conversation started]", initial_greeting)
+        
         while True:
             if args.sms:
                 question = input(f"{Colors.BLUE}{Colors.BOLD}You: {Colors.RESET}")
