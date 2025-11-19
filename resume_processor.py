@@ -7,6 +7,7 @@ import fitz  # PyMuPDF
 import numpy as np
 import ollama
 from text_processing import split_text_into_chunks, extract_name_from_text
+from security import validate_and_normalize_path
 
 
 def process_and_embed_resume(resume_pdf_path, personal_info_txt_path, personal_info_md_path, 
@@ -16,59 +17,79 @@ def process_and_embed_resume(resume_pdf_path, personal_info_txt_path, personal_i
     Saves chunks and embeddings to disk.
     Returns text_chunks, all_embeddings, personal_info_chunk_indices, and extracted_name.
     """
-    chunks_file = os.path.join(data_dir, "chunks.json")
-    embeddings_file = os.path.join(data_dir, "embeddings.npy")
-    metadata_file = os.path.join(data_dir, "chunk_metadata.json")
+    # Validate and normalize file paths
+    validated_resume_path = validate_and_normalize_path(resume_pdf_path)
+    validated_personal_info_txt = validate_and_normalize_path(personal_info_txt_path) if personal_info_txt_path else None
+    validated_personal_info_md = validate_and_normalize_path(personal_info_md_path) if personal_info_md_path else None
+    validated_data_dir = validate_and_normalize_path(data_dir) if data_dir else None
+    
+    if not validated_resume_path and not validated_personal_info_txt and not validated_personal_info_md:
+        print("Error: No valid file paths provided for resume or personal info files.")
+        return None, None, None, None
+    
+    if not validated_data_dir:
+        print("Error: Invalid data directory path.")
+        return None, None, None, None
+    
+    chunks_file = os.path.join(validated_data_dir, "chunks.json")
+    embeddings_file = os.path.join(validated_data_dir, "embeddings.npy")
+    metadata_file = os.path.join(validated_data_dir, "chunk_metadata.json")
     
     print("Checking for context files...")
     resume_text = ""
     personal_info_text = ""
     
     # 1. Read PDF
-    if os.path.exists(resume_pdf_path):
+    if validated_resume_path and os.path.exists(validated_resume_path):
         try:
-            doc = fitz.open(resume_pdf_path)
+            doc = fitz.open(validated_resume_path)
             for page in doc:
                 resume_text += page.get_text() + "\n" # Add newline separator
             
-            print(f"Successfully read {len(doc)} pages from PDF '{resume_pdf_path}'.")
+            print(f"Successfully read {len(doc)} pages from PDF '{validated_resume_path}'.")
             doc.close()
         except Exception as e:
-            print(f"Error reading PDF '{resume_pdf_path}': {e}")
+            print(f"Error reading PDF '{validated_resume_path}': {e}")
             # We can continue if the other file exists
     else:
-        print(f"Warning: Resume file not found at '{resume_pdf_path}'.")
+        if validated_resume_path:
+            print(f"Warning: Resume file not found at '{validated_resume_path}'.")
+        else:
+            print(f"Warning: Invalid resume file path '{resume_pdf_path}'.")
 
     # 2. Read personal info (MD or TXT) separately
     personal_file_found = False
     # Prioritize Markdown file
-    if os.path.exists(personal_info_md_path):
+    if validated_personal_info_md and os.path.exists(validated_personal_info_md):
         try:
-            with open(personal_info_md_path, "r") as f:
+            with open(validated_personal_info_md, "r") as f:
                 personal_info_text = f.read()
-            print(f"Successfully read markdown file '{personal_info_md_path}'.")
+            print(f"Successfully read markdown file '{validated_personal_info_md}'.")
             personal_file_found = True
         except Exception as e:
-            print(f"Error reading markdown file '{personal_info_md_path}': {e}")
+            print(f"Error reading markdown file '{validated_personal_info_md}': {e}")
     
     # If no MD file, check for TXT file as fallback
-    if not personal_file_found and os.path.exists(personal_info_txt_path):
+    if not personal_file_found and validated_personal_info_txt and os.path.exists(validated_personal_info_txt):
         try:
-            with open(personal_info_txt_path, "r") as f:
+            with open(validated_personal_info_txt, "r") as f:
                 personal_info_text = f.read()
-            print(f"Successfully read text file '{personal_info_txt_path}'.")
+            print(f"Successfully read text file '{validated_personal_info_txt}'.")
             personal_file_found = True
         except Exception as e:
-            print(f"Error reading text file '{personal_info_txt_path}': {e}")
+            print(f"Error reading text file '{validated_personal_info_txt}': {e}")
 
     if not personal_file_found:
-        print(f"Info: Personal info file not found at '{personal_info_md_path}' or '{personal_info_txt_path}'. This is optional.")
+        if validated_personal_info_md or validated_personal_info_txt:
+            print(f"Info: Personal info file not found. This is optional.")
+        else:
+            print(f"Info: Personal info file paths invalid. This is optional.")
 
     # 3. Check if we have any text at all
     full_text = resume_text + personal_info_text
     if not full_text.strip():
         print("Error: No text found from resume or personal info file.")
-        print(f"Please make sure '{resume_pdf_path}' or '{personal_info_md_path}' or '{personal_info_txt_path}' exists.")
+        print(f"Please make sure valid resume or personal info files exist.")
         return None, None, None, None
         
     print(f"Processing combined text...")
@@ -103,7 +124,7 @@ def process_and_embed_resume(resume_pdf_path, personal_info_txt_path, personal_i
     all_embeddings = []
     
     # Ensure data directory exists
-    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(validated_data_dir, exist_ok=True)
 
     try:
         for i, chunk in enumerate(text_chunks):
@@ -145,11 +166,17 @@ def load_data_from_disk(data_dir):
     Loads processed chunks and embeddings from the data directory.
     Returns text_chunks, all_embeddings, personal_info_chunk_indices, and extracted_name.
     """
-    chunks_file = os.path.join(data_dir, "chunks.json")
-    embeddings_file = os.path.join(data_dir, "embeddings.npy")
-    metadata_file = os.path.join(data_dir, "chunk_metadata.json")
+    # Validate data directory path
+    validated_data_dir = validate_and_normalize_path(data_dir)
+    if not validated_data_dir:
+        print(f"Error: Invalid data directory path '{data_dir}'.")
+        return None, None, None, None
     
-    print(f"Loading existing data from '{data_dir}' directory...")
+    chunks_file = os.path.join(validated_data_dir, "chunks.json")
+    embeddings_file = os.path.join(validated_data_dir, "embeddings.npy")
+    metadata_file = os.path.join(validated_data_dir, "chunk_metadata.json")
+    
+    print(f"Loading existing data from '{validated_data_dir}' directory...")
     if not os.path.exists(chunks_file) or not os.path.exists(embeddings_file):
         return None, None, None, None
 

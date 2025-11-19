@@ -23,6 +23,13 @@ def initialize_logging(logs_dir):
     # Open log file in append mode (though it will be new)
     log_file = open(log_filepath, 'a', encoding='utf-8')
     
+    # Set restrictive file permissions (owner read/write only)
+    try:
+        os.chmod(log_filepath, 0o600)
+    except Exception:
+        # Silently fail if chmod fails (e.g., on Windows)
+        pass
+    
     # Write session header
     session_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_file.write(f"{'='*80}\n")
