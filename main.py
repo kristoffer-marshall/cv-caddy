@@ -32,6 +32,8 @@ from config import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     DEFAULT_INITIAL_GREETING,
+    DEFAULT_THINKING_MESSAGE,
+    DEFAULT_BANNER,
     DEFAULT_BIND_ADDRESS,
     DEFAULT_MAX_REQUESTS_PER_MINUTE,
     DEFAULT_MAX_CONNECTIONS_PER_IP,
@@ -365,7 +367,7 @@ def generate_goodbye(llm_model, system_prompt, history_string, extracted_name, t
 def handle_telnet_client(client_socket, client_address, llm_model, embedding_model, system_prompt,
                          text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
                          context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
-                         initial_greeting_template, rate_limiter):
+                         initial_greeting_template, rate_limiter, thinking_message, banner=""):
     """
     Handle a single telnet client connection.
     
@@ -387,6 +389,8 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
         first_name: First name for display
         initial_greeting_template: Template for initial greeting (may contain ${NAME})
         rate_limiter: RateLimiter instance for rate limiting
+        thinking_message: Message to display while processing
+        banner: Banner message to display at conversation start
     """
     ip_address = client_address[0]
     
@@ -402,8 +406,9 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
         # Create a recruiter tracker for this client
         client_recruiter_tracker = RecruiterInfoTracker(applicant_name=extracted_name)
         
-        # Send "Thinking..." message
-        client_socket.sendall(b"\r\nThinking...\r\n")
+        # Send banner if configured
+        if banner and banner.strip():
+            client_socket.sendall(f"\r\n{banner}\r\n\r\n".encode('utf-8'))
         
         # Generate and send initial greeting
         initial_greeting = generate_initial_greeting(
@@ -479,9 +484,6 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
                 client_socket.sendall(f"\r\n{goodbye_message}\r\n".encode('utf-8'))
                 log_exchange(log_file, question, goodbye_message)
                 break
-            
-            # Send "Thinking..." message
-            client_socket.sendall(b"\r\nThinking...\r\n")
             
             # Get embedding for the question
             try:
@@ -595,7 +597,8 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                      context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
                      initial_greeting_template, rate_limiter, bind_address='127.0.0.1', 
                      connection_timeout=30.0, idle_timeout=300.0, shutdown_message=None,
-                     active_connections=None, server_socket_ref=None):
+                     active_connections=None, server_socket_ref=None, thinking_message="Thinking...",
+                     banner=""):
     """
     Run a telnet server that accepts connections and handles chatbot interactions.
     
@@ -621,6 +624,9 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
         idle_timeout: Idle timeout in seconds (default: 300.0)
         shutdown_message: Message to send to active connections on shutdown
         active_connections: List to track active connections for graceful shutdown
+        server_socket_ref: Reference to server socket for reload/shutdown handling
+        thinking_message: Message to display while processing
+        banner: Banner message to display at conversation start
     """
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -676,7 +682,7 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                             sock, addr, llm_model, embedding_model, system_prompt,
                             text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
                             context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
-                            initial_greeting_template, rate_limiter
+                            initial_greeting_template, rate_limiter, thinking_message, banner
                         )
                     finally:
                         if sock in active_connections:
@@ -827,14 +833,15 @@ def reload_config_and_data(config, args, data_dir, embedding_model, chunk_size, 
         
         system_prompt = config.get('Chatbot', 'SystemPrompt', fallback=DEFAULT_SYSTEM_PROMPT)
         initial_greeting_template = config.get('Chatbot', 'InitialGreeting', fallback=DEFAULT_INITIAL_GREETING)
+        banner = config.get('Chatbot', 'Banner', fallback=DEFAULT_BANNER)
+        thinking_message = config.get('Chatbot', 'ThinkingMessage', fallback=DEFAULT_THINKING_MESSAGE)
+        shutdown_message = config.get('Chatbot', 'ShutdownMessage', fallback=DEFAULT_SHUTDOWN_MESSAGE)
         
         bind_address = config.get('Security', 'BindAddress', fallback=DEFAULT_BIND_ADDRESS)
         max_requests_per_minute = config.getint('Security', 'MaxRequestsPerMinute', fallback=DEFAULT_MAX_REQUESTS_PER_MINUTE)
         max_connections_per_ip = config.getint('Security', 'MaxConnectionsPerIP', fallback=DEFAULT_MAX_CONNECTIONS_PER_IP)
         connection_timeout = config.getfloat('Security', 'ConnectionTimeout', fallback=DEFAULT_CONNECTION_TIMEOUT)
         idle_timeout = config.getfloat('Security', 'IdleTimeout', fallback=DEFAULT_IDLE_TIMEOUT)
-        
-        shutdown_message = config.get('Chatbot', 'ShutdownMessage', fallback=DEFAULT_SHUTDOWN_MESSAGE)
         
         # Reprocess resume
         print("Reloading: Reprocessing resume...")
@@ -864,6 +871,8 @@ def reload_config_and_data(config, args, data_dir, embedding_model, chunk_size, 
             'top_k_chunks': top_k_chunks,
             'system_prompt': system_prompt,
             'initial_greeting_template': initial_greeting_template,
+            'banner': banner,
+            'thinking_message': thinking_message,
             'bind_address': bind_address,
             'max_requests_per_minute': max_requests_per_minute,
             'max_connections_per_ip': max_connections_per_ip,
@@ -1002,6 +1011,8 @@ def main():
             config['Chatbot'] = {
                 'SystemPrompt': DEFAULT_SYSTEM_PROMPT,
                 'InitialGreeting': DEFAULT_INITIAL_GREETING,
+                'Banner': DEFAULT_BANNER,
+                'ThinkingMessage': DEFAULT_THINKING_MESSAGE,
                 'ShutdownMessage': DEFAULT_SHUTDOWN_MESSAGE
             }
             config['Security'] = {
@@ -1050,6 +1061,8 @@ def main():
     # Chatbot section
     system_prompt = config.get('Chatbot', 'SystemPrompt', fallback=DEFAULT_SYSTEM_PROMPT)
     initial_greeting_template = config.get('Chatbot', 'InitialGreeting', fallback=DEFAULT_INITIAL_GREETING)
+    banner = config.get('Chatbot', 'Banner', fallback=DEFAULT_BANNER)
+    thinking_message = config.get('Chatbot', 'ThinkingMessage', fallback=DEFAULT_THINKING_MESSAGE)
     shutdown_message = config.get('Chatbot', 'ShutdownMessage', fallback=DEFAULT_SHUTDOWN_MESSAGE)
     
     # Security section
@@ -1188,6 +1201,8 @@ def main():
                     top_k_chunks = config_vals['top_k_chunks']
                     system_prompt = config_vals['system_prompt']
                     initial_greeting_template = config_vals['initial_greeting_template']
+                    banner = config_vals['banner']
+                    thinking_message = config_vals['thinking_message']
                     bind_address = config_vals['bind_address']
                     max_requests_per_minute = config_vals['max_requests_per_minute']
                     max_connections_per_ip = config_vals['max_connections_per_ip']
@@ -1235,7 +1250,7 @@ def main():
                     text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
                     context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
                     initial_greeting_template, rate_limiter, bind_address, connection_timeout, 
-                    idle_timeout, shutdown_message, active_connections, server_socket_ref
+                    idle_timeout, shutdown_message, active_connections, server_socket_ref, thinking_message, banner
                 )
                 
                 # If server exits normally (not due to shutdown), wait a bit before restarting
@@ -1279,9 +1294,9 @@ def main():
     
     # 2. Start the chat loop (normal or SMS mode)
     try:
-        # Show "Thinking..." message
-        if not args.sms:
-            print("\nThinking...")
+        # Display banner if configured (only in non-SMS mode)
+        if banner and banner.strip() and not args.sms:
+            print(f"\n{banner}\n")
         
         # Generate and display initial greeting
         initial_greeting = generate_initial_greeting(
@@ -1351,9 +1366,7 @@ def main():
                 # Log the attempt but still process (with mitigation in prompt)
                 print(f"Warning: Suspicious input detected: {suspicious_patterns}")
 
-            if not args.sms:
-                print("\nThinking...")
-            elif args.sms:
+            if args.sms:
                 # Calculate reading delay based on message length
                 # Base delay: 0.3 seconds, plus 0.01 seconds per character (capped at reasonable max)
                 message_length = len(question)

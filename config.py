@@ -27,6 +27,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "Do not make up information. If unsure, say so politely. Act casual and natural."
 )
 DEFAULT_INITIAL_GREETING = "Hi, my name is ${NAME}! Are you here to interview me?"
+DEFAULT_THINKING_MESSAGE = "Thinking..."
+DEFAULT_BANNER = ""
 
 # Security defaults
 DEFAULT_BIND_ADDRESS = "127.0.0.1"  # Localhost only by default
