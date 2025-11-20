@@ -72,7 +72,6 @@ The program will automatically create a `config.ini` file on first run. The conf
 - `PersonalInfoTxtPath`: Path to personal info text file (optional)
 - `PersonalInfoMdPath`: Path to personal info markdown file (optional, preferred)
 - `DataDir`: Directory for storing processed data (chunks and embeddings)
-- `LogsDir`: Directory for storing conversation logs
 
 #### [Models]
 - `LlmModel`: Ollama model for LLM generation (default: `llama3.1:8b`)
@@ -175,7 +174,7 @@ python main.py -t -d
 The daemon will:
 - Fork into the background
 - Write a PID file (default: `/var/run/cv-caddy.pid` if root, `./cv-caddy.pid` otherwise)
-- Redirect output to log files in the `logs/` directory
+- Redirect output to log files (default: `cv-caddy-daemon.log` and `cv-caddy-daemon-error.log` in current directory)
 - Continue running until stopped
 
 **Custom PID file location:**
@@ -218,7 +217,7 @@ sudo systemctl start cv-caddy
 # Check status
 sudo systemctl status cv-caddy
 
-# View logs
+# View systemd logs
 sudo journalctl -u cv-caddy -f
 
 # Stop the service
@@ -304,7 +303,6 @@ cv-caddy/
 ├── rag.py                     # RAG (retrieval) functions
 ├── context_manager.py         # Conversation history management
 ├── recruiter_tracker.py       # Recruiter information extraction
-├── logging_utils.py           # Logging utilities
 ├── text_processing.py         # Text processing utilities
 ├── YOUR_RESUME.pdf            # Your resume (required)
 ├── personal_info.md           # Additional personal info (optional, preferred)
@@ -313,10 +311,6 @@ cv-caddy/
 │   ├── chunks.json            # Text chunks
 │   ├── embeddings.npy         # Embedding vectors
 │   └── chunk_metadata.json    # Metadata (name, personal info indices)
-├── logs/                      # Conversation logs (auto-generated)
-│   ├── conversation_*.log    # Timestamped conversation logs
-│   ├── cv-caddy-daemon.log    # Daemon stdout (when running as daemon)
-│   └── cv-caddy-daemon-error.log  # Daemon stderr (when running as daemon)
 └── cv-caddy.pid               # PID file (when running as daemon, if not root)
 ```
 
@@ -331,7 +325,6 @@ The application includes comprehensive security measures:
 - **Path Traversal Protection**: All file paths are validated to prevent directory traversal attacks
 - **Error Sanitization**: Error messages are sanitized to prevent information disclosure
 - **Secure Bind Address**: Defaults to localhost-only (127.0.0.1) to prevent network exposure
-- **Log File Permissions**: Log files are created with restrictive permissions (600)
 
 ## Troubleshooting
 
@@ -354,12 +347,12 @@ The application includes comprehensive security measures:
 - Check that the service is running: `sudo systemctl status cv-caddy`
 - Verify the bind address in `config.ini` (should be `127.0.0.1` for localhost)
 - Check firewall settings if binding to `0.0.0.0`
-- View logs: `sudo journalctl -u cv-caddy -f` (for systemd) or check `logs/cv-caddy-daemon.log`
+- View systemd logs: `sudo journalctl -u cv-caddy -f` (for systemd) or check daemon log files
 
 **Daemon won't start**
 - Check if another instance is already running: `python main.py --stop`
 - Verify PID file permissions
-- Check daemon logs: `logs/cv-caddy-daemon-error.log`
+- Check daemon error log file (default: `cv-caddy-daemon-error.log`)
 
 **Systemd service keeps restarting**
 - Check journal logs: `sudo journalctl -u cv-caddy -n 100`

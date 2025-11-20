@@ -45,7 +45,10 @@ from resume_processor import process_and_embed_resume, load_data_from_disk
 from rag import find_relevant_chunks
 from context_manager import ContextManager
 from recruiter_tracker import RecruiterInfoTracker
-from logging_utils import initialize_logging, update_log_header, log_exchange
+from logging_utils import (
+    initialize_session_log, log_session_exchange, close_session_log,
+    log_system_event, ensure_log_directory
+)
 from security import (
     validate_input_length, sanitize_input, detect_prompt_injection,
     validate_file_path, RateLimiter, sanitize_error_message,
@@ -366,8 +369,9 @@ def generate_goodbye(llm_model, system_prompt, history_string, extracted_name, t
 
 def handle_telnet_client(client_socket, client_address, llm_model, embedding_model, system_prompt,
                          text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
-                         context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
-                         initial_greeting_template, rate_limiter, thinking_message, banner=""):
+                         context_manager, top_k_chunks, temperature, top_p, first_name,
+                         initial_greeting_template, rate_limiter, thinking_message, banner="",
+                         logs_dir=None):
     """
     Handle a single telnet client connection.
     
@@ -382,7 +386,6 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
         personal_info_chunk_indices: List of indices for personal info chunks
         extracted_name: Extracted name from resume
         context_manager: ContextManager instance
-        log_file: Log file handle
         top_k_chunks: Number of top chunks to retrieve
         temperature: LLM temperature parameter
         top_p: LLM top_p parameter
@@ -391,8 +394,20 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
         rate_limiter: RateLimiter instance for rate limiting
         thinking_message: Message to display while processing
         banner: Banner message to display at conversation start
+        logs_dir: Path to log directory for session logging
     """
     ip_address = client_address[0]
+    
+    # Initialize session log for this client
+    session_log_file = None
+    session_log_filepath = None
+    session_id = None
+    if logs_dir:
+        session_log_file, session_log_filepath, session_id = initialize_session_log(
+            logs_dir, session_type=f"telnet_{ip_address}", ip_address=ip_address
+        )
+        if session_log_file:
+            log_system_event(logs_dir, "INFO", f"Telnet client connected from {ip_address}:{client_address[1]} (Session: {session_id})")
     
     try:
         # Create a new context manager for this client
@@ -422,8 +437,9 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
         # We add it as a Bot message with an empty User message to represent the start
         client_context.history.append(("Bot", initial_greeting))
         
-        # Log the initial greeting
-        log_exchange(log_file, "[Conversation started]", initial_greeting)
+        # Log initial greeting
+        if session_log_file:
+            log_session_exchange(session_log_file, "[Conversation started]", initial_greeting)
         
         while True:
             # Send prompt
@@ -482,7 +498,11 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
                     llm_model, system_prompt, history_string, extracted_name, temperature, top_p
                 )
                 client_socket.sendall(f"\r\n{goodbye_message}\r\n".encode('utf-8'))
-                log_exchange(log_file, question, goodbye_message)
+                
+                # Log goodbye exchange
+                if session_log_file:
+                    log_session_exchange(session_log_file, question, goodbye_message)
+                
                 break
             
             # Get embedding for the question
@@ -496,7 +516,10 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
                 error_msg = sanitize_error_message(e, include_details=False)
                 client_socket.sendall(f"\r\n{error_msg}\r\n".encode('utf-8'))
                 # Log detailed error server-side
-                print(f"Error getting embedding for query from {client_address[0]}: {sanitize_error_message(e, include_details=True)}")
+                detailed_error = sanitize_error_message(e, include_details=True)
+                print(f"Error getting embedding for query from {client_address[0]}: {detailed_error}")
+                if logs_dir:
+                    log_system_event(logs_dir, "ERROR", f"Error getting embedding for query from {ip_address}: {detailed_error}")
                 continue
             
             # Find relevant resume chunks
@@ -574,17 +597,32 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
                 client_recruiter_tracker.extract_info(llm_model)
                 
                 # Log the exchange
-                log_exchange(log_file, question, full_response.strip())
+                if session_log_file:
+                    log_session_exchange(session_log_file, question, full_response.strip())
                 
             except Exception as e:
                 error_msg = sanitize_error_message(e, include_details=False)
                 client_socket.sendall(f"\r\n{error_msg}\r\n".encode('utf-8'))
                 # Log detailed error server-side
-                print(f"Error generating response for {client_address[0]}: {sanitize_error_message(e, include_details=True)}")
+                detailed_error = sanitize_error_message(e, include_details=True)
+                print(f"Error generating response for {client_address[0]}: {detailed_error}")
+                if logs_dir:
+                    log_system_event(logs_dir, "ERROR", f"Error generating response for {ip_address}: {detailed_error}")
                 
     except Exception as e:
-        print(f"Error handling client {client_address}: {sanitize_error_message(e, include_details=True)}")
+        error_msg = sanitize_error_message(e, include_details=True)
+        print(f"Error handling client {client_address}: {error_msg}")
+        if logs_dir:
+            log_system_event(logs_dir, "ERROR", f"Error handling telnet client {ip_address}: {error_msg}")
     finally:
+        # Close session log
+        if session_log_file:
+            close_session_log(session_log_file, session_log_filepath, logs_dir, session_id, interrupted=False)
+        
+        if logs_dir:
+            log_system_event(logs_dir, "INFO", f"Telnet client disconnected: {ip_address}:{client_address[1]}")
+        
+        # Decrement connection count
         # Decrement connection count
         if rate_limiter:
             rate_limiter.decrement_connections(ip_address)
@@ -594,11 +632,11 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
 
 def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                      text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
-                     context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
+                     context_manager, top_k_chunks, temperature, top_p, first_name,
                      initial_greeting_template, rate_limiter, bind_address='127.0.0.1', 
                      connection_timeout=30.0, idle_timeout=300.0, shutdown_message=None,
                      active_connections=None, server_socket_ref=None, thinking_message="Thinking...",
-                     banner=""):
+                     banner="", logs_dir=None):
     """
     Run a telnet server that accepts connections and handles chatbot interactions.
     
@@ -612,7 +650,6 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
         personal_info_chunk_indices: List of indices for personal info chunks
         extracted_name: Extracted name from resume
         context_manager: ContextManager instance (used as template for per-client contexts)
-        log_file: Log file handle
         top_k_chunks: Number of top chunks to retrieve
         temperature: LLM temperature parameter
         top_p: LLM top_p parameter
@@ -627,7 +664,11 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
         server_socket_ref: Reference to server socket for reload/shutdown handling
         thinking_message: Message to display while processing
         banner: Banner message to display at conversation start
+        logs_dir: Path to log directory for logging
     """
+    if logs_dir:
+        log_system_event(logs_dir, "INFO", f"Starting telnet server on {bind_address}:{port}")
+    
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
@@ -640,8 +681,11 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
     
     # Warn if binding to all interfaces
     if bind_address == '0.0.0.0':
-        print(f"{Colors.YELLOW}Warning: Binding to 0.0.0.0 exposes the server to all network interfaces.{Colors.RESET}")
+        warning_msg = "Binding to 0.0.0.0 exposes the server to all network interfaces. Consider using 127.0.0.1 for localhost-only access."
+        print(f"{Colors.YELLOW}Warning: {warning_msg}{Colors.RESET}")
         print(f"{Colors.YELLOW}Consider using 127.0.0.1 for localhost-only access.{Colors.RESET}\n")
+        if logs_dir:
+            log_system_event(logs_dir, "WARNING", warning_msg)
     
     try:
         server_socket.bind((bind_address, port))
@@ -649,6 +693,8 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
         server_socket.settimeout(1.0)  # Allow periodic checking for interrupts
         
         print(f"\n{Colors.BOLD}{Colors.GREEN}🌐 Telnet Server Started{Colors.RESET}")
+        if logs_dir:
+            log_system_event(logs_dir, "INFO", f"Telnet server started successfully on {bind_address}:{port}")
         print(f"{Colors.DIM}Listening on {bind_address}:{port}...{Colors.RESET}")
         if bind_address == '127.0.0.1':
             print(f"{Colors.DIM}Connect with: telnet localhost {port}{Colors.RESET}")
@@ -665,7 +711,10 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                 # Check connection limit per IP
                 if rate_limiter:
                     if not rate_limiter.increment_connections(ip_address):
-                        print(f"Connection limit exceeded for {ip_address}, rejecting connection")
+                        error_msg = f"Connection limit exceeded for {ip_address}, rejecting connection"
+                        print(error_msg)
+                        if logs_dir:
+                            log_system_event(logs_dir, "WARNING", error_msg)
                         client_socket.sendall(b"Error: Connection limit exceeded. Please try again later.\r\n")
                         client_socket.close()
                         continue
@@ -681,8 +730,9 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                         handle_telnet_client(
                             sock, addr, llm_model, embedding_model, system_prompt,
                             text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
-                            context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
-                            initial_greeting_template, rate_limiter, thinking_message, banner
+                            context_manager, top_k_chunks, temperature, top_p, first_name,
+                            initial_greeting_template, rate_limiter, thinking_message, banner,
+                            logs_dir
                         )
                     finally:
                         if sock in active_connections:
@@ -703,12 +753,18 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                 break
             except Exception as e:
                 if not check_shutdown_requested():
-                    print(f"Error accepting connection: {e}")
+                    error_msg = f"Error accepting connection: {e}"
+                    print(error_msg)
+                    if logs_dir:
+                        log_system_event(logs_dir, "ERROR", error_msg)
                 continue
         
         # Graceful shutdown: notify active connections
         if shutdown_message and active_connections:
-            print(f"Notifying {len(active_connections)} active connections of shutdown...")
+            shutdown_msg = f"Notifying {len(active_connections)} active connections of shutdown..."
+            print(shutdown_msg)
+            if logs_dir:
+                log_system_event(logs_dir, "INFO", shutdown_msg)
             for conn in active_connections[:]:  # Copy list to avoid modification during iteration
                 try:
                     conn.sendall(f"\r\n{shutdown_message}\r\n".encode('utf-8'))
@@ -730,10 +786,15 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                     pass
                 
     except Exception as e:
-        print(f"Error starting telnet server: {e}")
+        error_msg = f"Error starting telnet server: {e}"
+        print(error_msg)
+        if logs_dir:
+            log_system_event(logs_dir, "ERROR", error_msg)
     finally:
         server_socket.close()
         print("Telnet server stopped.")
+        if logs_dir:
+            log_system_event(logs_dir, "INFO", "Telnet server stopped")
 
 
 def create_systemd_service_file():
@@ -1042,6 +1103,13 @@ def main():
     data_dir = config.get('Files', 'DataDir', fallback=DEFAULT_DATA_DIR)
     logs_dir = config.get('Files', 'LogsDir', fallback=DEFAULT_LOGS_DIR)
     
+    # Ensure log directory exists and log startup
+    if ensure_log_directory(logs_dir):
+        log_system_event(logs_dir, "INFO", "CV Caddy starting up")
+    else:
+        print(f"Warning: Could not create log directory '{logs_dir}'. Logging disabled.")
+        logs_dir = None
+    
     # Models section
     llm_model = config.get('Models', 'LlmModel', fallback=DEFAULT_LLM_MODEL)
     embedding_model = config.get('Models', 'EmbeddingModel', fallback=DEFAULT_EMBEDDING_MODEL)
@@ -1088,13 +1156,19 @@ def main():
     
     if text_chunks is None or all_embeddings is None:
         if args.reprocess:
-            print("\n--reprocess flag detected. Forcing file processing...")
+            reprocess_msg = "--reprocess flag detected. Forcing file processing..."
+            print(f"\n{reprocess_msg}")
+            if logs_dir:
+                log_system_event(logs_dir, "INFO", "Reprocessing resume and personal info files")
         text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name = process_and_embed_resume(
             resume_pdf_path, personal_info_txt_path, personal_info_md_path,
             data_dir, embedding_model, chunk_size, chunk_overlap
         )
         if text_chunks is None:
-            print("Exiting due to error.")
+            error_msg = "Failed to process resume. Exiting."
+            print(error_msg)
+            if logs_dir:
+                log_system_event(logs_dir, "ERROR", error_msg)
             return
     
     # Ensure personal_info_chunk_indices is a list (for backward compatibility)
@@ -1112,14 +1186,20 @@ def main():
         print(f"\n--- Ready to chat! (Setup took {end_time - start_time:.2f}s) ---")
         print("Ask any question about the resume. Type 'quit' to exit.")
         print(f"Context management: Max history tokens={max_history_tokens}, Min recent messages={min_recent_messages}")
-
-    # --- Initialize logging ---
-    log_file, log_filename, log_filepath = initialize_logging(logs_dir)
-    if not args.sms:
-        print(f"Conversation log: {log_filename}")
-    else:
-        print(f"{Colors.DIM}Conversation log: {log_filename}{Colors.RESET}")
     
+    if logs_dir:
+        log_system_event(logs_dir, "INFO", f"Setup completed in {end_time - start_time:.2f}s")
+
+    # --- Initialize session log for interactive/SMS mode ---
+    session_log_file = None
+    session_log_filepath = None
+    session_id = None
+    if not args.telnet and logs_dir:
+        session_type = "SMS" if args.sms else "interactive"
+        session_log_file, session_log_filepath, session_id = initialize_session_log(logs_dir, session_type=session_type)
+        if session_log_file:
+            print(f"Session log: session_{session_id}.log")
+
     # --- Create recruiter info tracker ---
     recruiter_tracker = RecruiterInfoTracker(applicant_name=extracted_name)
     
@@ -1144,13 +1224,22 @@ def main():
         is_systemd = os.environ.get('NOTIFY_SOCKET') is not None
         
         if args.daemon and not is_systemd:
-            if not daemonize(pid_file_path, logs_dir):
-                print("Error: Failed to daemonize")
+            if not daemonize(pid_file_path):
+                error_msg = "Failed to daemonize"
+                print(f"Error: {error_msg}")
+                if logs_dir:
+                    log_system_event(logs_dir, "ERROR", error_msg)
                 sys.exit(1)
-            print(f"Daemon started with PID {os.getpid()}")
+            daemon_msg = f"Daemon started with PID {os.getpid()}"
+            print(daemon_msg)
             print(f"PID file: {pid_file_path}")
+            if logs_dir:
+                log_system_event(logs_dir, "INFO", daemon_msg)
         elif args.daemon and is_systemd:
-            print("Note: Running under systemd, daemonization skipped (systemd handles process management)")
+            systemd_msg = "Running under systemd, daemonization skipped (systemd handles process management)"
+            print(f"Note: {systemd_msg}")
+            if logs_dir:
+                log_system_event(logs_dir, "INFO", systemd_msg)
         
         # Set up signal handlers
         active_connections = []
@@ -1225,12 +1314,10 @@ def main():
                         llm_model=llm_model
                     )
                     
-                    # Close old log file and open new one
-                    try:
-                        log_file.close()
-                    except Exception:
-                        pass
-                    log_file, log_filename, log_filepath = initialize_logging(logs_dir)
+                    # Update logs_dir if it changed in config
+                    logs_dir = config.get('Files', 'LogsDir', fallback=DEFAULT_LOGS_DIR)
+                    if ensure_log_directory(logs_dir):
+                        log_system_event(logs_dir, "INFO", "Configuration reloaded successfully")
                     
                     print("Reload complete, restarting server...")
                     # Close existing server socket
@@ -1241,16 +1328,20 @@ def main():
                             pass
                         server_socket_ref[0] = None
                 else:
-                    print("Reload failed, continuing with existing configuration")
+                    reload_fail_msg = "Reload failed, continuing with existing configuration"
+                    print(reload_fail_msg)
+                    if logs_dir:
+                        log_system_event(logs_dir, "ERROR", reload_fail_msg)
             
             # Run telnet server
             try:
                 run_telnet_server(
                     args.port, llm_model, embedding_model, system_prompt,
                     text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
-                    context_manager, log_file, top_k_chunks, temperature, top_p, first_name,
+                    context_manager, top_k_chunks, temperature, top_p, first_name,
                     initial_greeting_template, rate_limiter, bind_address, connection_timeout, 
-                    idle_timeout, shutdown_message, active_connections, server_socket_ref, thinking_message, banner
+                    idle_timeout, shutdown_message, active_connections, server_socket_ref, thinking_message, banner,
+                    logs_dir
                 )
                 
                 # If server exits normally (not due to shutdown), wait a bit before restarting
@@ -1270,20 +1361,6 @@ def main():
                     time.sleep(5)  # Wait before retrying
                 else:
                     break
-        
-        # Cleanup
-        try:
-            recruiter_tracker.extract_info(llm_model)
-            if recruiter_tracker.has_any_info():
-                update_log_header(log_filepath, recruiter_tracker)
-            
-            session_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            log_file.write(f"{'='*80}\n")
-            log_file.write(f"Telnet Server Session Ended: {session_end}\n")
-            log_file.write(f"{'='*80}\n")
-            log_file.close()
-        except:
-            pass  # Ignore errors when closing log file
         
         # Remove PID file if daemon
         if args.daemon:
@@ -1313,8 +1390,9 @@ def main():
         # Add initial greeting to context manager so it's remembered
         context_manager.history.append(("Bot", initial_greeting))
         
-        # Log the initial greeting
-        log_exchange(log_file, "[Conversation started]", initial_greeting)
+        # Log initial greeting
+        if session_log_file:
+            log_session_exchange(session_log_file, "[Conversation started]", initial_greeting)
         
         while True:
             if args.sms:
@@ -1341,8 +1419,10 @@ def main():
                 else:
                     print(f"\n{goodbye_message}")
                 
-                # Log the goodbye exchange
-                log_exchange(log_file, question, goodbye_message)
+                # Log goodbye exchange
+                if session_log_file:
+                    log_session_exchange(session_log_file, question, goodbye_message)
+                
                 break
             
             if not question.strip():
@@ -1511,15 +1591,6 @@ def main():
                 # Track recruiter/job information
                 recruiter_tracker.add_conversation(question, full_response.strip())
                 
-                # Periodically extract and update info (every 3 exchanges to avoid too many LLM calls)
-                if len(recruiter_tracker._conversation_text.split('\n\n')) % 6 == 0:
-                    recruiter_tracker.extract_info(llm_model)
-                    if recruiter_tracker.has_any_info():
-                        update_log_header(log_filepath, recruiter_tracker)
-                
-                # Log this exchange
-                log_exchange(log_file, question, full_response.strip())
-                
                 # Optional: Show context stats (only in normal mode, not SMS)
                 if not args.sms:
                     history_tokens = context_manager.get_history_token_count()
@@ -1537,16 +1608,11 @@ def main():
                 else:
                     print(f"\n{error_msg}")
                 
-                # Log the detailed error server-side
-                try:
-                    error_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    detailed_error = sanitize_error_message(e, include_details=True)
-                    log_file.write(f"[{error_timestamp}] Error: {detailed_error}\n\n")
-                    log_file.flush()
-                    # Also print to console for debugging
-                    print(f"Detailed error (server-side): {detailed_error}")
-                except:
-                    pass  # Ignore logging errors
+                # Log detailed error
+                detailed_error = sanitize_error_message(e, include_details=True)
+                print(f"Detailed error (server-side): {detailed_error}")
+                if logs_dir:
+                    log_system_event(logs_dir, "ERROR", f"Error generating response: {detailed_error}")
 
     except KeyboardInterrupt:
         if args.sms:
@@ -1555,26 +1621,14 @@ def main():
             print(f"\n{Colors.GRAY}Goodbye!{Colors.RESET}")
         else:
             print("\nGoodbye!")
-    finally:
-        # Always close the log file, whether normal exit or interrupt
-        try:
-            # Final extraction attempt before closing
-            recruiter_tracker.extract_info(llm_model)
-            if recruiter_tracker.has_any_info():
-                update_log_header(log_filepath, recruiter_tracker)
-            
-            session_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            log_file.write(f"{'='*80}\n")
-            # Check if we're exiting due to KeyboardInterrupt
-            exc_type = sys.exc_info()[0]
-            if exc_type is KeyboardInterrupt:
-                log_file.write(f"Conversation Session Ended (Interrupted): {session_end}\n")
-            else:
-                log_file.write(f"Conversation Session Ended: {session_end}\n")
-            log_file.write(f"{'='*80}\n")
-            log_file.close()
-        except:
-            pass  # Ignore errors when closing log file
+        
+        # Close session log
+        if session_log_file:
+            close_session_log(session_log_file, session_log_filepath, logs_dir, session_id, interrupted=True)
+        
+        # Log shutdown
+        if logs_dir:
+            log_system_event(logs_dir, "INFO", "CV Caddy shutting down (interrupted)")
 
 
 if __name__ == "__main__":

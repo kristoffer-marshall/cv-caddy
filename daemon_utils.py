@@ -167,15 +167,14 @@ def setup_signal_handlers(shutdown_callback=None, reload_callback=None):
     signal.signal(signal.SIGHUP, reload_handler)
 
 
-def daemonize(pid_file_path=None, log_dir=None, stdout_log=None, stderr_log=None):
+def daemonize(pid_file_path=None, stdout_log=None, stderr_log=None):
     """
     Daemonize the current process using double-fork method.
     
     Args:
         pid_file_path: Path to PID file (default: get_default_pid_file())
-        log_dir: Directory for log files (default: 'logs' - will be converted to absolute path)
-        stdout_log: Path to stdout log file (default: logs/cv-caddy-daemon.log)
-        stderr_log: Path to stderr log file (default: logs/cv-caddy-daemon-error.log)
+        stdout_log: Path to stdout log file (default: cv-caddy-daemon.log in current directory)
+        stderr_log: Path to stderr log file (default: cv-caddy-daemon-error.log in current directory)
     
     Returns:
         bool: True if daemonization successful, False otherwise
@@ -192,20 +191,14 @@ def daemonize(pid_file_path=None, log_dir=None, stdout_log=None, stderr_log=None
     # Store current working directory and convert log paths to absolute before chdir
     original_cwd = os.getcwd()
     
-    # Convert log directory to absolute path if it's relative
-    if log_dir is None:
-        log_dir = os.path.join(original_cwd, 'logs')
-    elif not os.path.isabs(log_dir):
-        log_dir = os.path.join(original_cwd, log_dir)
-    
     # Convert log file paths to absolute if they're relative
     if stdout_log is None:
-        stdout_log = os.path.join(log_dir, 'cv-caddy-daemon.log')
+        stdout_log = os.path.join(original_cwd, 'cv-caddy-daemon.log')
     elif not os.path.isabs(stdout_log):
         stdout_log = os.path.join(original_cwd, stdout_log)
     
     if stderr_log is None:
-        stderr_log = os.path.join(log_dir, 'cv-caddy-daemon-error.log')
+        stderr_log = os.path.join(original_cwd, 'cv-caddy-daemon-error.log')
     elif not os.path.isabs(stderr_log):
         stderr_log = os.path.join(original_cwd, stderr_log)
     
@@ -233,9 +226,6 @@ def daemonize(pid_file_path=None, log_dir=None, stdout_log=None, stderr_log=None
     except OSError as e:
         print(f"Error: Second fork failed: {e}", file=sys.stderr)
         return False
-    
-    # Create log directory (now using absolute path)
-    os.makedirs(log_dir, exist_ok=True)
     
     # Redirect stdout and stderr
     try:

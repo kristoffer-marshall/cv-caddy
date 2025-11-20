@@ -150,24 +150,6 @@ class RecruiterInfoTracker:
         
         return {}
     
-    def format_for_log(self):
-        """Format the tracked information for log file header."""
-        lines = []
-        lines.append("RECRUITER/INTERVIEWER INFORMATION:")
-        lines.append("-" * 80)
-        lines.append(f"Name: {self.recruiter_name or 'Not yet mentioned'}")
-        lines.append(f"Contact Info: {self.contact_info or 'Not yet mentioned'}")
-        lines.append("")
-        lines.append("JOB OPPORTUNITY:")
-        lines.append("-" * 80)
-        lines.append(f"Job Synopsis: {self.job_synopsis or 'Not yet mentioned'}")
-        lines.append(f"Benefits: {self.benefits or 'Not yet mentioned'}")
-        lines.append(f"Salary: {self.salary or 'Not yet mentioned'}")
-        lines.append("")
-        lines.append("=" * 80)
-        lines.append("")
-        return "\n".join(lines)
-    
     def has_any_info(self):
         """Check if any information has been extracted."""
         return any([self.recruiter_name, self.contact_info, self.job_synopsis, 
