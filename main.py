@@ -11,6 +11,9 @@ import signal
 import ollama
 import threading
 import socket
+import shutil
+import textwrap
+import re
 from datetime import datetime
 
 from config import (
@@ -78,6 +81,171 @@ class Colors:
     # Background colors
     BG_BLUE = '\033[104m'
     BG_GRAY = '\033[100m'
+
+
+def get_terminal_width():
+    """
+    Get the terminal width in columns.
+    
+    Returns:
+        int: Terminal width in columns, or 80 if unable to determine
+    """
+    try:
+        # Try to get terminal size
+        size = shutil.get_terminal_size()
+        return size.columns
+    except (OSError, AttributeError):
+        # Fallback to 80 columns if terminal size cannot be determined
+        return 80
+
+
+def wrap_text(text, width=None, prefix=""):
+    """
+    Wrap text respecting word boundaries.
+    
+    Args:
+        text: The text to wrap
+        width: Maximum width for wrapping (defaults to terminal width minus prefix length)
+        prefix: Prefix string to account for when calculating available width
+    
+    Returns:
+        str: Wrapped text with newlines
+    """
+    if not text:
+        return text
+    
+    # Calculate available width
+    if width is None:
+        terminal_width = get_terminal_width()
+        # Account for prefix length (including ANSI codes don't count toward width)
+        # Strip ANSI codes for width calculation
+        prefix_stripped = re.sub(r'\033\[[0-9;]*m', '', prefix)
+        available_width = terminal_width - len(prefix_stripped)
+        width = max(20, available_width)  # Minimum width of 20
+    
+    # Use textwrap to wrap the text
+    wrapped_lines = textwrap.wrap(text, width=width, break_long_words=False, break_on_hyphens=False)
+    return '\n'.join(wrapped_lines)
+
+
+def wrap_and_print(text, prefix="", **kwargs):
+    """
+    Convenience function that wraps text and prints it with a prefix.
+    
+    Args:
+        text: The text to wrap and print
+        prefix: Prefix to add to each line (default: "")
+        **kwargs: Additional arguments to pass to wrap_text
+    """
+    if not text:
+        return
+    
+    wrapped = wrap_text(text, prefix=prefix, **kwargs)
+    if prefix:
+        # Add prefix to first line, indent subsequent lines
+        lines = wrapped.split('\n')
+        if lines:
+            print(f"{prefix}{lines[0]}")
+            for line in lines[1:]:
+                # Calculate indent based on prefix length (excluding ANSI codes)
+                prefix_stripped = re.sub(r'\033\[[0-9;]*m', '', prefix)
+                indent = ' ' * len(prefix_stripped)
+                print(f"{indent}{line}")
+    else:
+        print(wrapped)
+
+
+class StreamingTextWrapper:
+    """
+    Wraps streaming text output to respect word boundaries and terminal width.
+    Buffers characters until word boundaries are reached, then wraps and outputs.
+    """
+    
+    def __init__(self, width=None, output_func=None):
+        """
+        Initialize the streaming text wrapper.
+        
+        Args:
+            width: Maximum line width (defaults to terminal width)
+            output_func: Function to call for output (defaults to print)
+        """
+        self.width = width if width is not None else get_terminal_width()
+        self.output_func = output_func if output_func else lambda s, **kwargs: print(s, end="", flush=True)
+        self.buffer = ""
+        self.current_line_length = 0
+    
+    def write(self, text):
+        """
+        Write text to the stream, wrapping at word boundaries.
+        
+        Args:
+            text: Text to write (can be partial words)
+        """
+        if not text:
+            return
+        
+        self.buffer += text
+        
+        # Process buffer, looking for word boundaries (spaces, newlines, punctuation)
+        while True:
+            # Find next space, newline, or other word boundary
+            space_idx = self.buffer.find(' ')
+            newline_idx = self.buffer.find('\n')
+            
+            # Determine the next boundary
+            next_boundary = None
+            if newline_idx != -1:
+                next_boundary = newline_idx + 1
+            elif space_idx != -1:
+                next_boundary = space_idx + 1
+            
+            # If buffer is getting too long without a boundary, force a break
+            if next_boundary is None:
+                if len(self.buffer) > self.width * 2:
+                    # Look for last space in first width*2 characters
+                    last_space = self.buffer.rfind(' ', 0, self.width * 2)
+                    if last_space != -1:
+                        next_boundary = last_space + 1
+                    else:
+                        # No space found, break at width
+                        next_boundary = min(self.width, len(self.buffer))
+                else:
+                    # Wait for more input
+                    break
+            
+            # Extract chunk up to boundary
+            chunk = self.buffer[:next_boundary]
+            self.buffer = self.buffer[next_boundary:]
+            
+            # Check if we need to wrap
+            chunk_len = len(chunk)
+            if self.current_line_length + chunk_len > self.width and self.current_line_length > 0:
+                # Need to wrap - output newline first
+                self.output_func('\n')
+                self.current_line_length = 0
+            
+            # Output the chunk
+            self.output_func(chunk)
+            self.current_line_length += chunk_len
+            
+            # Reset line length on newline
+            if '\n' in chunk:
+                self.current_line_length = 0
+    
+    def flush(self):
+        """Flush any remaining buffered text."""
+        if self.buffer:
+            # Check if we need a newline before outputting
+            if self.current_line_length + len(self.buffer) > self.width and self.current_line_length > 0:
+                self.output_func('\n')
+            self.output_func(self.buffer)
+            self.buffer = ""
+            self.current_line_length = 0
+    
+    def finish(self):
+        """Finish outputting, flushing any remaining text and adding final newline."""
+        self.flush()
+        self.output_func('\n')
 
 
 class TypingIndicator:
@@ -158,6 +326,7 @@ def get_first_name(full_name):
 def display_sms_message(message, is_user=False, sender_name=None):
     """
     Display a message in SMS/RCS style with colors.
+    Wraps text to respect terminal width and word boundaries.
     
     Args:
         message: The message text to display
@@ -166,11 +335,13 @@ def display_sms_message(message, is_user=False, sender_name=None):
     """
     if is_user:
         # User messages: blue text, bold
-        print(f"{Colors.BLUE}{Colors.BOLD}You:{Colors.RESET} {message}")
+        prefix = f"{Colors.BLUE}{Colors.BOLD}You:{Colors.RESET} "
+        wrap_and_print(message, prefix=prefix)
     else:
         # Bot messages: gray text, subtle
         display_name = sender_name if sender_name else "Them"
-        print(f"{Colors.GRAY}{display_name}:{Colors.RESET} {message}")
+        prefix = f"{Colors.GRAY}{display_name}:{Colors.RESET} "
+        wrap_and_print(message, prefix=prefix)
 
 
 def display_sms_response(response_text, typing_indicator, sender_name=None):
@@ -431,7 +602,9 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
             text_chunks, all_embeddings, personal_info_chunk_indices,
             top_k_chunks, embedding_model, temperature, top_p
         )
-        client_socket.sendall(f"\r\n{initial_greeting}\r\n\r\n".encode('utf-8'))
+        # Wrap greeting text before sending
+        wrapped_greeting = wrap_text(initial_greeting)
+        client_socket.sendall(f"\r\n{wrapped_greeting}\r\n\r\n".encode('utf-8'))
         
         # Add initial greeting to context manager so it's remembered
         # We add it as a Bot message with an empty User message to represent the start
@@ -497,7 +670,9 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
                 goodbye_message = generate_goodbye(
                     llm_model, system_prompt, history_string, extracted_name, temperature, top_p
                 )
-                client_socket.sendall(f"\r\n{goodbye_message}\r\n".encode('utf-8'))
+                # Wrap goodbye message before sending
+                wrapped_goodbye = wrap_text(goodbye_message)
+                client_socket.sendall(f"\r\n{wrapped_goodbye}\r\n".encode('utf-8'))
                 
                 # Log goodbye exchange
                 if session_log_file:
@@ -579,16 +754,23 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
                     }
                 )
                 
-                # Stream response to client
+                # Stream response to client with word wrapping
                 full_response = ""
                 client_socket.sendall(b"\r\n")
+                
+                # Create a wrapper that sends to socket
+                def socket_output(text, **kwargs):
+                    client_socket.sendall(text.encode('utf-8'))
+                
+                stream_wrapper = StreamingTextWrapper(output_func=socket_output)
                 for chunk in response_stream:
                     if not chunk['done']:
                         response_part = chunk['response']
+                        stream_wrapper.write(response_part)
                         full_response += response_part
-                        client_socket.sendall(response_part.encode('utf-8'))
+                stream_wrapper.finish()  # Flush and add final newline
                 
-                client_socket.sendall(b"\r\n\r\n")
+                client_socket.sendall(b"\r\n")
                 
                 # Add to context manager
                 client_context.add_exchange(question, full_response.strip())
@@ -1385,7 +1567,9 @@ def main():
         if args.sms:
             display_sms_message(initial_greeting, is_user=False, sender_name=first_name)
         else:
-            print(f"\n{initial_greeting}\n")
+            print()  # Empty line before greeting
+            wrap_and_print(initial_greeting)
+            print()  # Empty line after greeting
         
         # Add initial greeting to context manager so it's remembered
         context_manager.history.append(("Bot", initial_greeting))
@@ -1417,7 +1601,8 @@ def main():
                 if args.sms:
                     display_sms_response(goodbye_message, typing_indicator, sender_name=first_name)
                 else:
-                    print(f"\n{goodbye_message}")
+                    print()  # Empty line before goodbye
+                    wrap_and_print(goodbye_message)
                 
                 # Log goodbye exchange
                 if session_log_file:
@@ -1577,13 +1762,14 @@ def main():
                     # Display with typing simulation
                     display_sms_response(full_response.strip(), typing_indicator, sender_name=first_name)
                 else:
-                    # In normal mode, stream the response as it's generated
+                    # In normal mode, stream the response as it's generated with word wrapping
+                    stream_wrapper = StreamingTextWrapper()
                     for chunk in response_stream:
                         if not chunk['done']:
                             response_part = chunk['response']
-                            print(response_part, end="", flush=True)
+                            stream_wrapper.write(response_part)
                             full_response += response_part
-                    print() # Newline after the full response
+                    stream_wrapper.finish()  # Flush and add final newline
                 
                 # Add this exchange to context manager (handles windowing automatically)
                 context_manager.add_exchange(question, full_response.strip())
