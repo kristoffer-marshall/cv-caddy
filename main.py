@@ -60,7 +60,8 @@ from security import (
 from daemon_utils import (
     daemonize, setup_signal_handlers, check_shutdown_requested,
     check_reload_requested, clear_reload_request, get_default_pid_file,
-    send_signal_to_daemon, read_pid_file
+    send_signal_to_daemon, read_pid_file, get_default_status_file,
+    update_status_file, systemd_notify
 )
 
 
@@ -818,7 +819,7 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                      initial_greeting_template, rate_limiter, bind_address='127.0.0.1', 
                      connection_timeout=30.0, idle_timeout=300.0, shutdown_message=None,
                      active_connections=None, server_socket_ref=None, thinking_message="Thinking...",
-                     banner="", logs_dir=None):
+                     banner="", logs_dir=None, status_file_path=None):
     """
     Run a telnet server that accepts connections and handles chatbot interactions.
     
@@ -847,32 +848,56 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
         thinking_message: Message to display while processing
         banner: Banner message to display at conversation start
         logs_dir: Path to log directory for logging
+        status_file_path: Path to status file for health monitoring
     """
     if logs_dir:
         log_system_event(logs_dir, "INFO", f"Starting telnet server on {bind_address}:{port}")
     
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
-    # Store socket reference if provided (for reload/shutdown handling)
-    if server_socket_ref is not None:
-        server_socket_ref[0] = server_socket
-    
-    if active_connections is None:
-        active_connections = []
-    
-    # Warn if binding to all interfaces
-    if bind_address == '0.0.0.0':
-        warning_msg = "Binding to 0.0.0.0 exposes the server to all network interfaces. Consider using 127.0.0.1 for localhost-only access."
-        print(f"{Colors.YELLOW}Warning: {warning_msg}{Colors.RESET}")
-        print(f"{Colors.YELLOW}Consider using 127.0.0.1 for localhost-only access.{Colors.RESET}\n")
-        if logs_dir:
-            log_system_event(logs_dir, "WARNING", warning_msg)
+    server_socket = None
+    last_connection_time = time.time()
+    last_watchdog_update = time.time()
+    watchdog_interval = 30.0  # Update watchdog every 30 seconds
+    connection_count = 0
+    error_count = 0
     
     try:
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        # Store socket reference if provided (for reload/shutdown handling)
+        if server_socket_ref is not None:
+            server_socket_ref[0] = server_socket
+        
+        if active_connections is None:
+            active_connections = []
+        
+        # Warn if binding to all interfaces
+        if bind_address == '0.0.0.0':
+            warning_msg = "Binding to 0.0.0.0 exposes the server to all network interfaces. Consider using 127.0.0.1 for localhost-only access."
+            print(f"{Colors.YELLOW}Warning: {warning_msg}{Colors.RESET}")
+            print(f"{Colors.YELLOW}Consider using 127.0.0.1 for localhost-only access.{Colors.RESET}\n")
+            if logs_dir:
+                log_system_event(logs_dir, "WARNING", warning_msg)
+        
         server_socket.bind((bind_address, port))
         server_socket.listen(5)
         server_socket.settimeout(1.0)  # Allow periodic checking for interrupts
+        
+        # Update status: server is listening
+        if status_file_path:
+            update_status_file(status_file_path, {
+                'status': 'running',
+                'state': 'listening',
+                'bind_address': bind_address,
+                'port': port,
+                'active_connections': len(active_connections),
+                'total_connections': connection_count,
+                'error_count': error_count,
+                'last_connection_time': last_connection_time
+            })
+        
+        # Notify systemd that we're ready
+        systemd_notify(ready=True, status=f"Listening on {bind_address}:{port}")
         
         print(f"\n{Colors.BOLD}{Colors.GREEN}🌐 Telnet Server Started{Colors.RESET}")
         if logs_dir:
@@ -886,9 +911,59 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
         
         while not check_shutdown_requested():
             try:
+                # Update watchdog periodically
+                current_time = time.time()
+                if current_time - last_watchdog_update >= watchdog_interval:
+                    # Check if server socket is still valid
+                    try:
+                        # Try to get socket state
+                        server_socket.getsockname()
+                        socket_valid = True
+                    except (OSError, AttributeError):
+                        socket_valid = False
+                        error_msg = "Server socket is no longer valid"
+                        print(f"ERROR: {error_msg}")
+                        if logs_dir:
+                            log_system_event(logs_dir, "ERROR", error_msg)
+                        if status_file_path:
+                            update_status_file(status_file_path, {
+                                'status': 'error',
+                                'state': 'socket_invalid',
+                                'error': error_msg,
+                                'bind_address': bind_address,
+                                'port': port,
+                                'active_connections': len(active_connections),
+                                'total_connections': connection_count,
+                                'error_count': error_count,
+                                'last_connection_time': last_connection_time
+                            })
+                        systemd_notify(status=f"ERROR: {error_msg}")
+                        break  # Exit loop to restart server
+                    
+                    # Update status file
+                    if status_file_path:
+                        update_status_file(status_file_path, {
+                            'status': 'running',
+                            'state': 'listening',
+                            'bind_address': bind_address,
+                            'port': port,
+                            'active_connections': len(active_connections),
+                            'total_connections': connection_count,
+                            'error_count': error_count,
+                            'last_connection_time': last_connection_time,
+                            'socket_valid': socket_valid,
+                            'uptime_seconds': current_time - last_connection_time if last_connection_time else 0
+                        })
+                    
+                    # Update systemd watchdog
+                    systemd_notify(watchdog=True, status=f"Listening on {bind_address}:{port}, {len(active_connections)} active connections")
+                    last_watchdog_update = current_time
+                
                 client_socket, client_address = server_socket.accept()
                 client_socket.settimeout(connection_timeout)
                 ip_address = client_address[0]
+                connection_count += 1
+                last_connection_time = time.time()
                 
                 # Check connection limit per IP
                 if rate_limiter:
@@ -897,14 +972,35 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                         print(error_msg)
                         if logs_dir:
                             log_system_event(logs_dir, "WARNING", error_msg)
-                        client_socket.sendall(b"Error: Connection limit exceeded. Please try again later.\r\n")
-                        client_socket.close()
+                        try:
+                            client_socket.sendall(b"Error: Connection limit exceeded. Please try again later.\r\n")
+                        except Exception:
+                            pass
+                        try:
+                            client_socket.close()
+                        except Exception:
+                            pass
                         continue
                 
-                print(f"Client connected from {ip_address}:{client_address[1]}")
+                print(f"Client connected from {ip_address}:{client_address[1]} (total: {connection_count})")
+                if logs_dir:
+                    log_system_event(logs_dir, "INFO", f"Client connected from {ip_address}:{client_address[1]}")
                 
                 # Track connection for graceful shutdown
                 active_connections.append(client_socket)
+                
+                # Update status with new connection
+                if status_file_path:
+                    update_status_file(status_file_path, {
+                        'status': 'running',
+                        'state': 'listening',
+                        'bind_address': bind_address,
+                        'port': port,
+                        'active_connections': len(active_connections),
+                        'total_connections': connection_count,
+                        'error_count': error_count,
+                        'last_connection_time': last_connection_time
+                    })
                 
                 # Handle client in a new thread
                 def client_handler_wrapper(sock, addr):
@@ -916,9 +1012,29 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                             initial_greeting_template, rate_limiter, thinking_message, banner,
                             logs_dir
                         )
+                    except Exception as e:
+                        error_msg = f"Error in client handler for {addr}: {e}"
+                        print(f"ERROR: {error_msg}")
+                        if logs_dir:
+                            log_system_event(logs_dir, "ERROR", error_msg)
+                        import traceback
+                        if logs_dir:
+                            log_system_event(logs_dir, "ERROR", f"Traceback: {traceback.format_exc()}")
                     finally:
                         if sock in active_connections:
                             active_connections.remove(sock)
+                        # Update status when connection closes
+                        if status_file_path:
+                            update_status_file(status_file_path, {
+                                'status': 'running',
+                                'state': 'listening',
+                                'bind_address': bind_address,
+                                'port': port,
+                                'active_connections': len(active_connections),
+                                'total_connections': connection_count,
+                                'error_count': error_count,
+                                'last_connection_time': last_connection_time
+                            })
                 
                 client_thread = threading.Thread(
                     target=client_handler_wrapper,
@@ -932,13 +1048,58 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                 continue
             except KeyboardInterrupt:
                 print(f"\n{Colors.YELLOW}Shutting down telnet server...{Colors.RESET}")
+                if logs_dir:
+                    log_system_event(logs_dir, "INFO", "Shutdown requested via KeyboardInterrupt")
                 break
-            except Exception as e:
+            except OSError as e:
                 if not check_shutdown_requested():
-                    error_msg = f"Error accepting connection: {e}"
-                    print(error_msg)
+                    error_count += 1
+                    error_msg = f"Socket error accepting connection: {e}"
+                    print(f"ERROR: {error_msg}")
                     if logs_dir:
                         log_system_event(logs_dir, "ERROR", error_msg)
+                    if status_file_path:
+                        update_status_file(status_file_path, {
+                            'status': 'error',
+                            'state': 'socket_error',
+                            'error': str(e),
+                            'bind_address': bind_address,
+                            'port': port,
+                            'active_connections': len(active_connections),
+                            'total_connections': connection_count,
+                            'error_count': error_count,
+                            'last_connection_time': last_connection_time
+                        })
+                    systemd_notify(status=f"ERROR: {error_msg}")
+                    # If socket is closed, we need to exit and let the main loop restart
+                    if e.errno == 9:  # EBADF - Bad file descriptor
+                        print("ERROR: Server socket is closed, exiting to allow restart")
+                        if logs_dir:
+                            log_system_event(logs_dir, "ERROR", "Server socket closed, exiting to allow restart")
+                        break
+                continue
+            except Exception as e:
+                if not check_shutdown_requested():
+                    error_count += 1
+                    error_msg = f"Error accepting connection: {e}"
+                    print(f"ERROR: {error_msg}")
+                    if logs_dir:
+                        log_system_event(logs_dir, "ERROR", error_msg)
+                        import traceback
+                        log_system_event(logs_dir, "ERROR", f"Traceback: {traceback.format_exc()}")
+                    if status_file_path:
+                        update_status_file(status_file_path, {
+                            'status': 'error',
+                            'state': 'accept_error',
+                            'error': str(e),
+                            'bind_address': bind_address,
+                            'port': port,
+                            'active_connections': len(active_connections),
+                            'total_connections': connection_count,
+                            'error_count': error_count,
+                            'last_connection_time': last_connection_time
+                        })
+                    systemd_notify(status=f"ERROR: {error_msg}")
                 continue
         
         # Graceful shutdown: notify active connections
@@ -961,22 +1122,69 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
         
         if active_connections:
             print(f"Force closing {len(active_connections)} remaining connections...")
+            if logs_dir:
+                log_system_event(logs_dir, "WARNING", f"Force closing {len(active_connections)} remaining connections")
             for conn in active_connections:
                 try:
                     conn.close()
                 except Exception:
                     pass
+        
+        # Update status: server is stopping
+        if status_file_path:
+            update_status_file(status_file_path, {
+                'status': 'stopping',
+                'state': 'shutdown',
+                'bind_address': bind_address,
+                'port': port,
+                'active_connections': 0,
+                'total_connections': connection_count,
+                'error_count': error_count,
+                'last_connection_time': last_connection_time
+            })
+        
+        systemd_notify(stopping=True, status="Shutting down telnet server")
                 
     except Exception as e:
         error_msg = f"Error starting telnet server: {e}"
-        print(error_msg)
+        print(f"ERROR: {error_msg}")
         if logs_dir:
             log_system_event(logs_dir, "ERROR", error_msg)
+            import traceback
+            log_system_event(logs_dir, "ERROR", f"Traceback: {traceback.format_exc()}")
+        if status_file_path:
+            update_status_file(status_file_path, {
+                'status': 'error',
+                'state': 'startup_error',
+                'error': str(e),
+                'bind_address': bind_address,
+                'port': port,
+                'active_connections': 0,
+                'total_connections': connection_count,
+                'error_count': error_count
+            })
+        systemd_notify(status=f"ERROR: {error_msg}")
+        raise  # Re-raise to allow main loop to handle
     finally:
-        server_socket.close()
+        if server_socket:
+            try:
+                server_socket.close()
+            except Exception:
+                pass
         print("Telnet server stopped.")
         if logs_dir:
             log_system_event(logs_dir, "INFO", "Telnet server stopped")
+        if status_file_path:
+            update_status_file(status_file_path, {
+                'status': 'stopped',
+                'state': 'stopped',
+                'bind_address': bind_address,
+                'port': port,
+                'active_connections': 0,
+                'total_connections': connection_count,
+                'error_count': error_count
+            })
+        systemd_notify(stopping=True, status="Telnet server stopped")
 
 
 def create_systemd_service_file():
@@ -1001,7 +1209,7 @@ Description=CV Caddy Resume Chatbot Service
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
 User={current_user}
 WorkingDirectory={working_dir}
 ExecStart={python_exec} {script_path} --telnet
@@ -1010,6 +1218,8 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=cv-caddy
+WatchdogSec=60
+NotifyAccess=all
 
 [Install]
 WantedBy=multi-user.target
@@ -1515,6 +1725,9 @@ def main():
                     if logs_dir:
                         log_system_event(logs_dir, "ERROR", reload_fail_msg)
             
+            # Get status file path
+            status_file_path = get_default_status_file()
+            
             # Run telnet server
             try:
                 run_telnet_server(
@@ -1523,12 +1736,22 @@ def main():
                     context_manager, top_k_chunks, temperature, top_p, first_name,
                     initial_greeting_template, rate_limiter, bind_address, connection_timeout, 
                     idle_timeout, shutdown_message, active_connections, server_socket_ref, thinking_message, banner,
-                    logs_dir
+                    logs_dir, status_file_path
                 )
                 
                 # If server exits normally (not due to shutdown), wait a bit before restarting
                 if not check_shutdown_requested():
-                    print("Server exited unexpectedly, waiting before restart...")
+                    error_msg = "Server exited unexpectedly, waiting before restart..."
+                    print(error_msg)
+                    if logs_dir:
+                        log_system_event(logs_dir, "WARNING", error_msg)
+                    if status_file_path:
+                        update_status_file(status_file_path, {
+                            'status': 'restarting',
+                            'state': 'server_exited',
+                            'error': 'Server exited unexpectedly, restarting...'
+                        })
+                    systemd_notify(status="Server exited unexpectedly, restarting...")
                     time.sleep(2)
                 
             except KeyboardInterrupt:
@@ -1537,9 +1760,21 @@ def main():
                 break
             except Exception as e:
                 if not check_shutdown_requested():
-                    print(f"Error in server: {e}")
+                    error_msg = f"Error in server: {e}"
+                    print(f"ERROR: {error_msg}")
                     import traceback
                     traceback.print_exc()
+                    if logs_dir:
+                        log_system_event(logs_dir, "ERROR", error_msg)
+                        log_system_event(logs_dir, "ERROR", f"Traceback: {traceback.format_exc()}")
+                    if status_file_path:
+                        update_status_file(status_file_path, {
+                            'status': 'error',
+                            'state': 'server_error',
+                            'error': str(e),
+                            'error_type': type(e).__name__
+                        })
+                    systemd_notify(status=f"ERROR: {error_msg}")
                     time.sleep(5)  # Wait before retrying
                 else:
                     break

@@ -6,6 +6,7 @@ import sys
 import signal
 import atexit
 import time
+import json
 from pathlib import Path
 
 
@@ -275,4 +276,142 @@ def clear_reload_request():
     """Clear the reload request flag."""
     global reload_requested
     reload_requested = False
+
+
+def get_default_status_file():
+    """
+    Get the default status file path based on whether running as root.
+    
+    Returns:
+        str: Path to status file
+    """
+    if os.geteuid() == 0:
+        # Running as root, use system directory
+        return '/var/run/cv-caddy.status'
+    else:
+        # Running as regular user, use current directory
+        return os.path.join(os.getcwd(), 'cv-caddy.status')
+
+
+def update_status_file(status_file_path, status_data):
+    """
+    Update the status file with current daemon status.
+    
+    Args:
+        status_file_path: Path to status file
+        status_data: Dictionary with status information
+    """
+    try:
+        status_data['timestamp'] = time.time()
+        status_data['pid'] = os.getpid()
+        
+        status_dir = os.path.dirname(status_file_path)
+        if status_dir and not os.path.exists(status_dir):
+            os.makedirs(status_dir, exist_ok=True)
+        
+        with open(status_file_path, 'w') as f:
+            json.dump(status_data, f, indent=2)
+    except Exception as e:
+        # Don't fail if status file can't be written
+        pass
+
+
+def read_status_file(status_file_path):
+    """
+    Read the status file.
+    
+    Args:
+        status_file_path: Path to status file
+    
+    Returns:
+        dict: Status data, or None if file doesn't exist or is invalid
+    """
+    try:
+        if not os.path.exists(status_file_path):
+            return None
+        
+        with open(status_file_path, 'r') as f:
+            return json.load(f)
+    except (ValueError, IOError, json.JSONDecodeError):
+        return None
+
+
+def systemd_notify(message=None, status=None, errno=None, bus_error=None, pid=None, uid=None, gid=None, fdname=None, fds=None, main_pid=None, ready=None, stopping=None, reloading=None, watchdog=None, watchdog_usec=None, extend_timeout_usec=None):
+    """
+    Send notification to systemd using sd_notify protocol.
+    
+    Args:
+        message: Status message
+        status: Status string
+        ready: Set to True to notify systemd that service is ready
+        stopping: Set to True to notify systemd that service is stopping
+        reloading: Set to True to notify systemd that service is reloading
+        watchdog: Set to True to update watchdog timestamp
+        main_pid: Main PID of the service
+        fds: File descriptor names
+        fdname: File descriptor name
+        errno: Error number
+        bus_error: D-Bus error
+        pid: Process ID
+        uid: User ID
+        gid: Group ID
+        extend_timeout_usec: Extend timeout in microseconds
+    
+    Returns:
+        bool: True if notification sent successfully, False otherwise
+    """
+    notify_socket = os.environ.get('NOTIFY_SOCKET')
+    if not notify_socket:
+        return False
+    
+    # Remove leading @ if present (abstract socket)
+    if notify_socket.startswith('@'):
+        notify_socket = '\0' + notify_socket[1:]
+    
+    try:
+        import socket as sock
+        sock_obj = sock.socket(sock.AF_UNIX, sock.SOCK_DGRAM)
+        
+        # Build notification message
+        parts = []
+        if ready is not None:
+            parts.append(f"READY={1 if ready else 0}")
+        if status:
+            parts.append(f"STATUS={status}")
+        if message:
+            parts.append(f"STATUS={message}")
+        if stopping is not None:
+            parts.append(f"STOPPING={1 if stopping else 0}")
+        if reloading is not None:
+            parts.append(f"RELOADING={1 if reloading else 0}")
+        if watchdog is not None:
+            parts.append(f"WATCHDOG={1 if watchdog else 0}")
+        if main_pid is not None:
+            parts.append(f"MAINPID={main_pid}")
+        if errno is not None:
+            parts.append(f"ERRNO={errno}")
+        if bus_error:
+            parts.append(f"BUSERROR={bus_error}")
+        if pid is not None:
+            parts.append(f"PID={pid}")
+        if uid is not None:
+            parts.append(f"UID={uid}")
+        if gid is not None:
+            parts.append(f"GID={gid}")
+        if fdname:
+            parts.append(f"FDNAME={fdname}")
+        if fds:
+            parts.append(f"FDS={fds}")
+        if extend_timeout_usec is not None:
+            parts.append(f"EXTEND_TIMEOUT_USEC={extend_timeout_usec}")
+        
+        if not parts:
+            return False
+        
+        notification = '\n'.join(parts)
+        sock_obj.sendto(notification.encode('utf-8'), notify_socket)
+        sock_obj.close()
+        return True
+    except Exception:
+        return False
 
