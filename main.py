@@ -540,6 +540,132 @@ def generate_goodbye(llm_model, system_prompt, history_string, extracted_name, t
         return "Thank you so much for your time! I really appreciate the opportunity to speak with you. Looking forward to hearing about next steps."
 
 
+# Telnet protocol constants
+IAC = 255  # Interpret As Command
+WILL = 251
+WONT = 252
+DO = 253
+DONT = 254
+SB = 250  # Subnegotiation Begin
+SE = 240  # Subnegotiation End
+NAWS = 31  # Negotiate About Window Size
+
+
+def negotiate_telnet_options(client_socket, default_width=120, logs_dir=None):
+    """
+    Negotiate telnet options, specifically NAWS (Negotiate About Window Size).
+    
+    Args:
+        client_socket: The socket connection to the client
+        default_width: Default width to use if NAWS negotiation fails
+        logs_dir: Path to log directory for logging (optional)
+    
+    Returns:
+        int: Terminal width from NAWS, or default_width if not available
+    """
+    terminal_width = default_width
+    
+    try:
+        # Request NAWS from client
+        client_socket.sendall(bytes([IAC, DO, NAWS]))
+        
+        # Set a short timeout for negotiation
+        original_timeout = client_socket.gettimeout()
+        client_socket.settimeout(2.0)
+        
+        try:
+            # Read and process telnet option negotiation
+            buffer = b''
+            max_negotiation_bytes = 1024
+            bytes_read = 0
+            
+            while bytes_read < max_negotiation_bytes:
+                data = client_socket.recv(1024)
+                if not data:
+                    break
+                
+                buffer += data
+                bytes_read += len(data)
+                
+                # Look for NAWS subnegotiation: IAC SB NAWS width_high width_low height_high height_low IAC SE
+                iac_pos = buffer.find(IAC)
+                while iac_pos != -1 and iac_pos < len(buffer) - 1:
+                    if iac_pos + 2 < len(buffer):
+                        cmd = buffer[iac_pos + 1]
+                        
+                        # Check for subnegotiation (SB)
+                        if cmd == SB:
+                            # Look for SE to find end of subnegotiation
+                            se_pos = buffer.find(bytes([IAC, SE]), iac_pos + 2)
+                            if se_pos != -1:
+                                subneg_data = buffer[iac_pos + 2:se_pos]
+                                if len(subneg_data) >= 1 and subneg_data[0] == NAWS:
+                                    # Parse NAWS data: width_high, width_low, height_high, height_low
+                                    if len(subneg_data) >= 5:
+                                        width_high = subneg_data[1]
+                                        width_low = subneg_data[2]
+                                        height_high = subneg_data[3]
+                                        height_low = subneg_data[4]
+                                        
+                                        # Calculate width (16-bit value)
+                                        width = (width_high << 8) | width_low
+                                        height = (height_high << 8) | height_low
+                                        
+                                        if width > 0 and width < 1000:  # Sanity check
+                                            terminal_width = width
+                                            if logs_dir:
+                                                log_system_event(logs_dir, "INFO", 
+                                                    f"NAWS negotiation successful: {width}x{height}")
+                                        
+                                        # Remove processed subnegotiation from buffer
+                                        buffer = buffer[se_pos + 2:]
+                                        iac_pos = buffer.find(IAC)
+                                        continue
+                        
+                        # Handle WILL/WONT responses for NAWS
+                        elif cmd in (WILL, WONT) and iac_pos + 2 < len(buffer):
+                            option = buffer[iac_pos + 2]
+                            if option == NAWS:
+                                # Client responded to our DO NAWS
+                                if cmd == WILL:
+                                    # Client will send window size, wait for it
+                                    pass
+                                else:
+                                    # Client won't send window size, use default
+                                    break
+                                buffer = buffer[iac_pos + 3:]
+                                iac_pos = buffer.find(IAC)
+                                continue
+                    
+                    # Move past this IAC
+                    iac_pos = buffer.find(IAC, iac_pos + 1)
+                
+                # If we've processed all IACs and have a valid width, we're done
+                if terminal_width != default_width:
+                    break
+                
+                # Small delay to allow more data to arrive
+                time.sleep(0.1)
+                
+        except socket.timeout:
+            # Timeout is OK, use default width
+            pass
+        except Exception as e:
+            # Log but don't fail - use default width
+            if logs_dir:
+                log_system_event(logs_dir, "WARNING", f"Error during NAWS negotiation: {e}")
+        finally:
+            # Restore original timeout
+            client_socket.settimeout(original_timeout)
+            
+    except Exception as e:
+        # If negotiation fails, just use default width
+        if logs_dir:
+            log_system_event(logs_dir, "WARNING", f"NAWS negotiation failed: {e}")
+    
+    return terminal_width
+
+
 def handle_telnet_client(client_socket, client_address, llm_model, embedding_model, system_prompt,
                          text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
                          context_manager, top_k_chunks, temperature, top_p, first_name,
@@ -595,6 +721,9 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
         # Create a recruiter tracker for this client
         client_recruiter_tracker = RecruiterInfoTracker(applicant_name=extracted_name)
         
+        # Negotiate telnet options (NAWS for terminal size)
+        actual_terminal_width = negotiate_telnet_options(client_socket, telnet_line_width, logs_dir)
+        
         # Send banner if configured
         if banner and banner.strip():
             client_socket.sendall(f"\r\n{banner}\r\n\r\n".encode('utf-8'))
@@ -605,8 +734,8 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
             text_chunks, all_embeddings, personal_info_chunk_indices,
             top_k_chunks, embedding_model, temperature, top_p
         )
-        # Wrap greeting text before sending
-        wrapped_greeting = wrap_text(initial_greeting, width=telnet_line_width)
+        # Wrap greeting text before sending (use negotiated width)
+        wrapped_greeting = wrap_text(initial_greeting, width=actual_terminal_width)
         client_socket.sendall(f"\r\n{wrapped_greeting}\r\n\r\n".encode('utf-8'))
         
         # Add initial greeting to context manager so it's remembered
@@ -673,8 +802,8 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
                 goodbye_message = generate_goodbye(
                     llm_model, system_prompt, history_string, extracted_name, temperature, top_p
                 )
-                # Wrap goodbye message before sending
-                wrapped_goodbye = wrap_text(goodbye_message, width=telnet_line_width)
+                # Wrap goodbye message before sending (use negotiated width)
+                wrapped_goodbye = wrap_text(goodbye_message, width=actual_terminal_width)
                 client_socket.sendall(f"\r\n{wrapped_goodbye}\r\n".encode('utf-8'))
                 
                 # Log goodbye exchange
@@ -765,7 +894,7 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
                 def socket_output(text, **kwargs):
                     client_socket.sendall(text.encode('utf-8'))
                 
-                stream_wrapper = StreamingTextWrapper(width=telnet_line_width, output_func=socket_output)
+                stream_wrapper = StreamingTextWrapper(width=actual_terminal_width, output_func=socket_output)
                 for chunk in response_stream:
                     if not chunk['done']:
                         response_part = chunk['response']
