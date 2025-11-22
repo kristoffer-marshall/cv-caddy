@@ -40,3 +40,6 @@ DEFAULT_IDLE_TIMEOUT = 300.0
 # Daemon defaults
 DEFAULT_SHUTDOWN_MESSAGE = "I apologize, but I need to step away for a moment. Thank you for the conversation!"
 
+# Display defaults
+DEFAULT_TELNET_LINE_WIDTH = 120  # Default line width for telnet connections
+

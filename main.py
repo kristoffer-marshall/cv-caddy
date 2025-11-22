@@ -42,7 +42,8 @@ from config import (
     DEFAULT_MAX_CONNECTIONS_PER_IP,
     DEFAULT_CONNECTION_TIMEOUT,
     DEFAULT_IDLE_TIMEOUT,
-    DEFAULT_SHUTDOWN_MESSAGE
+    DEFAULT_SHUTDOWN_MESSAGE,
+    DEFAULT_TELNET_LINE_WIDTH
 )
 from resume_processor import process_and_embed_resume, load_data_from_disk
 from rag import find_relevant_chunks
@@ -543,7 +544,7 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
                          text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
                          context_manager, top_k_chunks, temperature, top_p, first_name,
                          initial_greeting_template, rate_limiter, thinking_message, banner="",
-                         logs_dir=None):
+                         logs_dir=None, telnet_line_width=120):
     """
     Handle a single telnet client connection.
     
@@ -567,6 +568,7 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
         thinking_message: Message to display while processing
         banner: Banner message to display at conversation start
         logs_dir: Path to log directory for session logging
+        telnet_line_width: Line width for word wrapping in telnet connections (default: 120)
     """
     ip_address = client_address[0]
     
@@ -604,7 +606,7 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
             top_k_chunks, embedding_model, temperature, top_p
         )
         # Wrap greeting text before sending
-        wrapped_greeting = wrap_text(initial_greeting)
+        wrapped_greeting = wrap_text(initial_greeting, width=telnet_line_width)
         client_socket.sendall(f"\r\n{wrapped_greeting}\r\n\r\n".encode('utf-8'))
         
         # Add initial greeting to context manager so it's remembered
@@ -672,7 +674,7 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
                     llm_model, system_prompt, history_string, extracted_name, temperature, top_p
                 )
                 # Wrap goodbye message before sending
-                wrapped_goodbye = wrap_text(goodbye_message)
+                wrapped_goodbye = wrap_text(goodbye_message, width=telnet_line_width)
                 client_socket.sendall(f"\r\n{wrapped_goodbye}\r\n".encode('utf-8'))
                 
                 # Log goodbye exchange
@@ -763,7 +765,7 @@ def handle_telnet_client(client_socket, client_address, llm_model, embedding_mod
                 def socket_output(text, **kwargs):
                     client_socket.sendall(text.encode('utf-8'))
                 
-                stream_wrapper = StreamingTextWrapper(output_func=socket_output)
+                stream_wrapper = StreamingTextWrapper(width=telnet_line_width, output_func=socket_output)
                 for chunk in response_stream:
                     if not chunk['done']:
                         response_part = chunk['response']
@@ -819,7 +821,7 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                      initial_greeting_template, rate_limiter, bind_address='127.0.0.1', 
                      connection_timeout=30.0, idle_timeout=300.0, shutdown_message=None,
                      active_connections=None, server_socket_ref=None, thinking_message="Thinking...",
-                     banner="", logs_dir=None, status_file_path=None):
+                     banner="", logs_dir=None, status_file_path=None, telnet_line_width=120):
     """
     Run a telnet server that accepts connections and handles chatbot interactions.
     
@@ -849,6 +851,7 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
         banner: Banner message to display at conversation start
         logs_dir: Path to log directory for logging
         status_file_path: Path to status file for health monitoring
+        telnet_line_width: Line width for word wrapping in telnet connections (default: 120)
     """
     if logs_dir:
         log_system_event(logs_dir, "INFO", f"Starting telnet server on {bind_address}:{port}")
@@ -1010,7 +1013,7 @@ def run_telnet_server(port, llm_model, embedding_model, system_prompt,
                             text_chunks, all_embeddings, personal_info_chunk_indices, extracted_name,
                             context_manager, top_k_chunks, temperature, top_p, first_name,
                             initial_greeting_template, rate_limiter, thinking_message, banner,
-                            logs_dir
+                            logs_dir, telnet_line_width
                         )
                     except Exception as e:
                         error_msg = f"Error in client handler for {addr}: {e}"
@@ -1289,6 +1292,7 @@ def reload_config_and_data(config, args, data_dir, embedding_model, chunk_size, 
         banner = config.get('Chatbot', 'Banner', fallback=DEFAULT_BANNER)
         thinking_message = config.get('Chatbot', 'ThinkingMessage', fallback=DEFAULT_THINKING_MESSAGE)
         shutdown_message = config.get('Chatbot', 'ShutdownMessage', fallback=DEFAULT_SHUTDOWN_MESSAGE)
+        telnet_line_width = config.getint('Chatbot', 'TelnetLineWidth', fallback=DEFAULT_TELNET_LINE_WIDTH)
         
         bind_address = config.get('Security', 'BindAddress', fallback=DEFAULT_BIND_ADDRESS)
         max_requests_per_minute = config.getint('Security', 'MaxRequestsPerMinute', fallback=DEFAULT_MAX_REQUESTS_PER_MINUTE)
@@ -1331,7 +1335,8 @@ def reload_config_and_data(config, args, data_dir, embedding_model, chunk_size, 
             'max_connections_per_ip': max_connections_per_ip,
             'connection_timeout': connection_timeout,
             'idle_timeout': idle_timeout,
-            'shutdown_message': shutdown_message
+            'shutdown_message': shutdown_message,
+            'telnet_line_width': telnet_line_width
         }
         
         print("Reload: Configuration and data reloaded successfully")
@@ -1466,7 +1471,8 @@ def main():
                 'InitialGreeting': DEFAULT_INITIAL_GREETING,
                 'Banner': DEFAULT_BANNER,
                 'ThinkingMessage': DEFAULT_THINKING_MESSAGE,
-                'ShutdownMessage': DEFAULT_SHUTDOWN_MESSAGE
+                'ShutdownMessage': DEFAULT_SHUTDOWN_MESSAGE,
+                'TelnetLineWidth': str(DEFAULT_TELNET_LINE_WIDTH)
             }
             config['Security'] = {
                 'BindAddress': DEFAULT_BIND_ADDRESS,
@@ -1524,6 +1530,7 @@ def main():
     banner = config.get('Chatbot', 'Banner', fallback=DEFAULT_BANNER)
     thinking_message = config.get('Chatbot', 'ThinkingMessage', fallback=DEFAULT_THINKING_MESSAGE)
     shutdown_message = config.get('Chatbot', 'ShutdownMessage', fallback=DEFAULT_SHUTDOWN_MESSAGE)
+    telnet_line_width = config.getint('Chatbot', 'TelnetLineWidth', fallback=DEFAULT_TELNET_LINE_WIDTH)
     
     # Security section
     bind_address = config.get('Security', 'BindAddress', fallback=DEFAULT_BIND_ADDRESS)
@@ -1690,6 +1697,7 @@ def main():
                     connection_timeout = config_vals['connection_timeout']
                     idle_timeout = config_vals['idle_timeout']
                     shutdown_message = config_vals['shutdown_message']
+                    telnet_line_width = config_vals['telnet_line_width']
                     
                     # Reinitialize rate limiter
                     rate_limiter = RateLimiter(
@@ -1736,7 +1744,7 @@ def main():
                     context_manager, top_k_chunks, temperature, top_p, first_name,
                     initial_greeting_template, rate_limiter, bind_address, connection_timeout, 
                     idle_timeout, shutdown_message, active_connections, server_socket_ref, thinking_message, banner,
-                    logs_dir, status_file_path
+                    logs_dir, status_file_path, telnet_line_width
                 )
                 
                 # If server exits normally (not due to shutdown), wait a bit before restarting

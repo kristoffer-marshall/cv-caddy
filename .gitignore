@@ -3,6 +3,7 @@ data/
 logs/
 *.pdf
 config.ini
+cv-caddy.status
 
 # Python Virtual Environment
 my-new-env/
